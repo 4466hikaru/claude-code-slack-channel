@@ -1375,6 +1375,30 @@ export function resolveJournalPath(
   return { path: null, source: null }
 }
 
+/** Parse `SLACK_BRIDGE_DISABLE` from env. Truthy values (`1`, `true`, `yes`,
+ *  case-insensitive) put server.ts into passive mode: no Socket Mode
+ *  connection, no journal open, no supervisor start, and every MCP tool
+ *  call returns an isError stub naming the disabled state.
+ *
+ *  This is the single-owner escape hatch for multi-session setups. When
+ *  two Claude Code processes both load the slack-channel plugin, both
+ *  spawn their own server.ts subprocess (stdio-MCP architecture), and
+ *  both write to the shared `~/.claude/channels/slack/` state dir —
+ *  triggering the "single-writer per state directory" undefined behavior
+ *  warned about in CLAUDE.md. Setting `SLACK_BRIDGE_DISABLE=1` on the
+ *  non-bridge sessions keeps exactly one writer for the audit log,
+ *  sessions, and Socket Mode connection while still letting Claude Code
+ *  load the plugin (so the user's per-project tool allowlist stays
+ *  consistent).
+ *
+ *  Pure: no side effects, takes env explicitly, suitable for unit tests.
+ */
+export function isBridgeDisabled(env: Readonly<Record<string, string | undefined>>): boolean {
+  const raw = env.SLACK_BRIDGE_DISABLE
+  if (typeof raw !== 'string') return false
+  return ['1', 'true', 'yes'].includes(raw.trim().toLowerCase())
+}
+
 // ---------------------------------------------------------------------------
 // Policy decision routing
 // ---------------------------------------------------------------------------

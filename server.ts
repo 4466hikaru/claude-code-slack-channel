@@ -39,6 +39,7 @@ import {
   escMrkdwn,
   formatVerifyResult,
   type GateResult,
+  isBridgeDisabled,
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
@@ -198,6 +199,14 @@ function loadEnv(): { botToken: string; appToken: string } {
 }
 
 const { botToken, appToken } = loadEnv()
+
+// Bridge-disable flag — single-owner escape hatch for multi-session setups.
+// When set (`SLACK_BRIDGE_DISABLE=1`), this server.ts runs in passive mode:
+// the MCP transport still connects so Claude Code's tool registry stays
+// consistent, but socket.start, journal open, and supervisor boot are all
+// skipped, and every tool call / permission relay returns an isError stub.
+// See `isBridgeDisabled()` in lib.ts for the rationale.
+const BRIDGE_DISABLED = isBridgeDisabled(process.env)
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -1611,6 +1620,18 @@ const toolHandlers: Record<string, ToolHandler> = {
 }
 
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (BRIDGE_DISABLED) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'This session is configured as bridge-disabled (SLACK_BRIDGE_DISABLE=1). Slack tools are not available in this session; route Slack work through the bridge-enabled session.',
+        },
+      ],
+      isError: true,
+    }
+  }
+
   const { name } = request.params
   let args = (request.params.arguments || {}) as Record<string, any>
 
@@ -1740,6 +1761,12 @@ mcp.setNotificationHandler(
   }: {
     params: { request_id: string; tool_name: string; description: string; input_preview: string }
   }) => {
+    // Bridge-disabled sessions don't post anything to Slack — including
+    // permission prompts. Silently drop the notification so Claude Code's
+    // permission flow falls back to its in-CLI prompt instead of waiting
+    // on a Slack approval that will never arrive.
+    if (BRIDGE_DISABLED) return
+
     if (!VALID_REQUEST_ID.test(params.request_id)) return
 
     const access = getAccess()
@@ -2693,6 +2720,19 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'))
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  if (BRIDGE_DISABLED) {
+    console.error(
+      '[slack] SLACK_BRIDGE_DISABLE=1 — passive mode: no Socket Mode, no journal, no supervisor. ' +
+        'MCP tool calls will return a disabled-state error.',
+    )
+    const transport = new StdioServerTransport()
+    transport.onclose = () => void shutdown('stdio transport closed')
+    await mcp.connect(transport)
+    process.stdin.on('end', () => void shutdown('stdin EOF'))
+    process.stdin.on('close', () => void shutdown('stdin closed'))
+    return
+  }
+
   // Open audit journal if --audit-log-file or SLACK_AUDIT_LOG is set.
   // Opt-in per ccsc-5pi.6: absent configuration disables journaling
   // entirely and every hook that would write an event becomes a

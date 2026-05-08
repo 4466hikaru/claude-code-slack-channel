@@ -6947,6 +6947,42 @@ describe('parseVerifyArg', () => {
 })
 
 // ---------------------------------------------------------------------------
+// isBridgeDisabled — single-owner escape hatch for multi-session setups
+// ---------------------------------------------------------------------------
+
+describe('isBridgeDisabled', () => {
+  const loadLib = async () => await import('./lib.ts')
+
+  test('returns false when SLACK_BRIDGE_DISABLE is unset', async () => {
+    const { isBridgeDisabled } = await loadLib()
+    expect(isBridgeDisabled({})).toBe(false)
+    expect(isBridgeDisabled({ OTHER_VAR: '1' })).toBe(false)
+  })
+
+  test('accepts canonical truthy values (case-insensitive)', async () => {
+    const { isBridgeDisabled } = await loadLib()
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: '1' })).toBe(true)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'true' })).toBe(true)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'TRUE' })).toBe(true)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'yes' })).toBe(true)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'YES' })).toBe(true)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: '  1  ' })).toBe(true)
+  })
+
+  test('rejects falsy / unrecognized values rather than guessing', async () => {
+    const { isBridgeDisabled } = await loadLib()
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: '' })).toBe(false)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: '0' })).toBe(false)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'false' })).toBe(false)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'no' })).toBe(false)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'on' })).toBe(false)
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: 'enabled' })).toBe(false)
+    // Non-string (e.g. unset env presented as undefined): false
+    expect(isBridgeDisabled({ SLACK_BRIDGE_DISABLE: undefined })).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // formatVerifyResult — ccsc-t7j, Epic 30-A.15
 // ---------------------------------------------------------------------------
 
