@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`scripts/claude-bridge-disabled.ps1` operator wrapper.** PowerShell launcher that sets `SLACK_BRIDGE_DISABLE=1` in the spawned `claude` process's environment and forwards remaining arguments. Use it for the secondary (non-bridge) Claude Code session on Windows when project-scoped `.claude/settings.local.json env` propagation to MCP child processes can't be relied on. The bridge-holding session keeps using plain `claude`.
 
+- **Optional `blocks` parameter on the `reply` MCP tool** for Block Kit support. When set, the message is sent in a single `chat.postMessage` call with the provided blocks; the existing chunking path is bypassed. `text` remains required and serves as the Slack notification fallback. The schema caps `blocks` at 50 (Slack's API limit) and uses `z.array(z.unknown())` so the Slack SDK's structural validation stays the source of truth for block contents — we don't re-derive a Block Kit type tree on top of theirs. Five new schema-level tests in `server.test.ts` lock in the required-text contract, the 50-block boundary, and rejection of non-array `blocks`. Motivated by the multi-agent rollout (2026-05-08) which needs richly-formatted, single-post review summaries instead of chunk-spammed chat lines.
+
 ## [0.9.0] - 2026-04-23
 
 ### Added

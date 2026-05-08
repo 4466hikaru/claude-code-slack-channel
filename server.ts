@@ -675,6 +675,14 @@ const ReplyInput = z
     text: z.string().min(1),
     thread_ts: z.string().optional(),
     files: z.array(z.string()).optional(),
+    // Optional Block Kit payload. Slack accepts up to 50 blocks per
+    // chat.postMessage (https://api.slack.com/reference/block-kit/blocks).
+    // We don't validate block contents here — the Slack API rejects
+    // malformed shapes with a clear error — but we cap the array length
+    // and keep `text` required so notifications still have a fallback.
+    // When `blocks` is set, the multi-chunk path is bypassed and a
+    // single postMessage is sent.
+    blocks: z.array(z.unknown()).max(50).optional(),
   })
   .strict()
 
@@ -761,12 +769,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments.',
+        'Send a message to a Slack channel or DM. Auto-chunks long text. Supports file attachments and optional Block Kit blocks.',
       inputSchema: {
         type: 'object' as const,
         properties: {
           chat_id: { type: 'string', description: 'Slack channel or DM ID' },
-          text: { type: 'string', description: 'Message text (mrkdwn supported)' },
+          text: {
+            type: 'string',
+            description:
+              'Message text (mrkdwn supported). Used as the notification fallback when blocks are present.',
+          },
           thread_ts: {
             type: 'string',
             description: 'Thread timestamp to reply in-thread (optional)',
@@ -775,6 +787,12 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'array',
             items: { type: 'string' },
             description: 'Absolute paths of files to upload (optional)',
+          },
+          blocks: {
+            type: 'array',
+            items: { type: 'object' },
+            description:
+              'Optional Block Kit blocks (max 50). When set, the message is sent as one Slack post (no chunking) and `text` is used as the notification fallback.',
           },
         },
         required: ['chat_id', 'text'],
@@ -935,6 +953,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
   const text: string = args.text
   const threadTs: string | undefined = args.thread_ts
   const files: string[] | undefined = args.files
+  const blocks: unknown[] | undefined = args.blocks
 
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
@@ -957,21 +976,39 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     input: { channel: chatId, thread_ts: threadTs },
   })
 
-  const access = ctx.getAccess()
-  const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
-  const mode = access.chunkMode || 'newline'
-  const chunks = chunkText(text, limit, mode)
-
   let lastTs = ''
-  for (const chunk of chunks) {
+  let chunkCount: number
+
+  if (blocks && blocks.length > 0) {
+    // Block Kit path: single send. `text` is required and serves as the
+    // notification fallback Slack shows where blocks can't render.
     const res = await ctx.web.chat.postMessage({
       channel: chatId,
-      text: chunk,
+      text,
+      blocks: blocks as any,
       thread_ts: threadTs,
       unfurl_links: false,
       unfurl_media: false,
     })
     lastTs = (res.ts as string) || lastTs
+    chunkCount = 1
+  } else {
+    const access = ctx.getAccess()
+    const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
+    const mode = access.chunkMode || 'newline'
+    const chunks = chunkText(text, limit, mode)
+    chunkCount = chunks.length
+
+    for (const chunk of chunks) {
+      const res = await ctx.web.chat.postMessage({
+        channel: chatId,
+        text: chunk,
+        thread_ts: threadTs,
+        unfurl_links: false,
+        unfurl_media: false,
+      })
+      lastTs = (res.ts as string) || lastTs
+    }
   }
 
   // Upload files if provided
@@ -1002,7 +1039,7 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     content: [
       {
         type: 'text',
-        text: `Sent ${chunks.length} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
+        text: `Sent ${chunkCount} message(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}`,
       },
     ],
   }

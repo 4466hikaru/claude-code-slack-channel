@@ -8368,6 +8368,7 @@ describe('MCP tool input schemas (S5)', () => {
       text: z.string().min(1),
       thread_ts: z.string().optional(),
       files: z.array(z.string()).optional(),
+      blocks: z.array(z.unknown()).max(50).optional(),
     })
     .strict()
 
@@ -8511,6 +8512,62 @@ describe('MCP tool input schemas (S5)', () => {
       if (!result.success) {
         expect(result.error.message).not.toContain(secret)
         expect(JSON.stringify(result.error.issues)).not.toContain(secret)
+      }
+    })
+
+    test('accepts optional blocks array', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '*hi*' } }],
+      })
+      expect(result.success).toBe(true)
+      if (result.success) {
+        expect(Array.isArray(result.data.blocks)).toBe(true)
+        expect(result.data.blocks).toHaveLength(1)
+      }
+    })
+
+    test('rejects non-array blocks', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: 'not-an-array',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects blocks array longer than 50 (Slack limit)', () => {
+      // Slack's chat.postMessage API caps blocks at 50; we enforce the
+      // same cap at validation time so a malformed call fails fast
+      // rather than reaching the network.
+      const tooMany = Array.from({ length: 51 }, () => ({ type: 'divider' }))
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: tooMany,
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('accepts blocks array of exactly 50 (Slack limit boundary)', () => {
+      const exactly = Array.from({ length: 50 }, () => ({ type: 'divider' }))
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        text: 'fallback',
+        blocks: exactly,
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('still requires text even when blocks present (notification fallback contract)', () => {
+      const result = ReplyInput.safeParse({
+        chat_id: 'C123',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'x' } }],
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues.some((i) => i.path.join('.') === 'text')).toBe(true)
       }
     })
   })
