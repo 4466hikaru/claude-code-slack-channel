@@ -108,9 +108,9 @@ writes a YAML frontmatter file to the **absolute** queue directory
 ### Three forms (case-insensitive prefix and keys)
 
 ```
-[codex-review] pr=<github-pr-url> summary=<text>
-[codex-review] issue=<github-issue-url> summary=<text>
-[codex-review] repo=<owner/repo> pr=<number> summary=<text>
+[codex-review] pr=<github-pr-url> [role=<role>] summary=<text>
+[codex-review] issue=<github-issue-url> [role=<role>] summary=<text>
+[codex-review] repo=<owner/repo> pr=<number> [role=<role>] summary=<text>
 ```
 
 - Exactly one space between the prefix and the args.
@@ -118,6 +118,10 @@ writes a YAML frontmatter file to the **absolute** queue directory
   text (free-form, may contain spaces).
 - The three forms are exclusive (e.g. `pr=` and `issue=` together is
   invalid).
+- Optional `role=hikaru|consultant|executor|agent` (case-insensitive
+  value). Invalid role -> format error. If omitted, the handler
+  derives the role from the sender: `hikaru` when sender ==
+  `hikaruUserId`, `agent` otherwise.
 - Unknown keys are rejected with format error.
 
 ### Frontmatter (8 required fields + Slack metadata)
@@ -202,11 +206,19 @@ filename:
 
 ## Authorization
 
-Only messages whose Slack `user` field equals the configured
-`hikaruUserId` are honored. All other senders are silently ignored at
-the gate. The watcher does **not** consult the prod bridge's
-`access.json` allowlist — it has its own narrow, hardcoded
-authorization scope.
+The watcher gates per-trigger:
+
+- **Hikaru-only**: `[abort-test]` / `[abort]` / `[abort cleanup]` /
+  `status?` / `prs?`. The Slack `user` field must equal the
+  configured `hikaruUserId`.
+- **Allowlist (`codexReviewSenderUserIds`, default `[hikaruUserId]`)**:
+  `[codex-review]` only. Lets the prod bridge bot, consultant
+  session, executor session, etc. push completion reports directly
+  to the queue without going through Hikaru's account.
+
+All other senders are silently ignored at the gate. The watcher does
+**not** consult the prod bridge's `access.json` allowlist — it has
+its own narrow, hardcoded authorization scope.
 
 ## Destructive ops
 
@@ -249,15 +261,17 @@ Create `$SLACK_STATE_DIR/inbound-watcher.config.json` (default
 {
   "hikaruUserId": "U01234567",
   "hikaruDmChannel": "D01234567",
-  "pollIntervalMs": 5000
+  "pollIntervalMs": 5000,
+  "codexReviewSenderUserIds": ["U01234567", "U_BRIDGE_BOT"]
 }
 ```
 
 | field | required | notes |
 |---|---|---|
-| `hikaruUserId` | yes | `U…` Slack user id of the only allowed sender |
+| `hikaruUserId` | yes | `U…` Slack user id of the only allowed sender for the Hikaru-only triggers |
 | `hikaruDmChannel` | yes | `D…` Slack DM channel id (find via Slack UI, or `conversations.list types=im`) |
 | `pollIntervalMs` | no | poll cadence; must be in `[3000, 60000]` |
+| `codexReviewSenderUserIds` | no | extra Slack `U…` ids allowed to use **`[codex-review]`** (defaults to `[hikaruUserId]`). Validated `^U[A-Z0-9]+$` per entry. The 5 Hikaru-only triggers ignore this list. |
 
 Out-of-range or non-finite `pollIntervalMs` (anything outside
 `[3000, 60000]`, `NaN`, or infinity) is replaced with the default

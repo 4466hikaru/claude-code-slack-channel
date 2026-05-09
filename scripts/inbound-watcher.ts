@@ -49,9 +49,14 @@
  * Handler routing is pinned by routeTrigger() + the test file so that
  * the [abort] / [abort cleanup] semantics cannot accidentally flip.
  *
- * Authorization: only messages whose Slack `user` equals the
- * configured hikaruUserId are honored. Other senders are silently
- * ignored.
+ * Authorization: per-trigger gate.
+ *   - `[abort-test]` / `[abort]` / `[abort cleanup]` / `status?` /
+ *     `prs?` are Hikaru-only (sender must equal `hikaruUserId`).
+ *   - `[codex-review]` accepts any sender on the allowlist
+ *     `codexReviewSenderUserIds` (default `[hikaruUserId]`). This
+ *     lets bot / consultant / executor sessions push completion
+ *     reports to the queue without going through Hikaru's account.
+ *   Other senders are silently ignored at the gate.
  *
  * Destructive ops: the watcher manipulates ONE flag path only:
  *   /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2
@@ -61,7 +66,7 @@
  * separate write-only path (no rm).
  *
  * State files (in $SLACK_STATE_DIR)
- *   inbound-watcher.config.json   required: { hikaruUserId, hikaruDmChannel, pollIntervalMs? }
+ *   inbound-watcher.config.json   required: { hikaruUserId, hikaruDmChannel, pollIntervalMs?, codexReviewSenderUserIds? }
  *   inbound-watcher.last-ts       persisted last-seen Slack ts
  *   inbound-watcher.pid           single-instance lockfile
  *
@@ -104,6 +109,11 @@ const CODEX_REVIEW_QUEUE_DIR =
 // only (reviewed entries are excluded by countActiveEntries()).
 const MAX_QUEUE_PENDING = 50
 const WARN_QUEUE_PENDING = 20
+
+// Allowed values for the optional `role=` argument on [codex-review].
+// `hikaru` is the implicit default when sender == hikaruUserId; `agent`
+// is the implicit default for any other allowlisted sender.
+const ALLOWED_ROLES = new Set(['hikaru', 'consultant', 'executor', 'agent'])
 
 // Repos surveyed by `prs?` and `status?`. Order is the listing order
 // in `prs?` output. Total result rows are capped at PR_LIMIT.
@@ -252,6 +262,7 @@ export type CodexReviewParsed =
       repo: string
       pr_number: number
       summary: string
+      role?: string
     }
   | {
       form: 'issue-url'
@@ -259,12 +270,14 @@ export type CodexReviewParsed =
       issue_url: string
       issue_number: number
       summary: string
+      role?: string
     }
   | {
       form: 'repo-pr'
       repo: string
       pr_number: number
       summary: string
+      role?: string
     }
 
 export type CodexReviewError = { error: string }
@@ -285,6 +298,10 @@ export type CodexReviewError = { error: string }
  *     summary text (free-form, may contain spaces).
  *   - The three forms are exclusive (e.g. `pr=` and `issue=` together
  *     is invalid).
+ *   - Optional `role=hikaru|consultant|executor|agent` (case-
+ *     insensitive value). Invalid role -> error. Default sender_role
+ *     resolution lives in the handler (hikaru if sender is the
+ *     configured hikaruUserId, agent otherwise).
  *   - Unknown keys are an error.
  */
 export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewError {
@@ -328,11 +345,24 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
   }
 
   // Validate keys.
-  const allowedKeys = new Set(['pr', 'issue', 'repo'])
+  const allowedKeys = new Set(['pr', 'issue', 'repo', 'role'])
   for (const k of Object.keys(kvs)) {
     if (!allowedKeys.has(k)) {
       return { error: `unknown key: ${k}` }
     }
+  }
+
+  // Optional `role=` validation. Lowercase the value so the canonical
+  // form goes into the parsed result and downstream frontmatter.
+  let role: string | undefined
+  if ('role' in kvs) {
+    const r = kvs.role.toLowerCase()
+    if (!ALLOWED_ROLES.has(r)) {
+      return {
+        error: `invalid role=${kvs.role} (allowed: ${[...ALLOWED_ROLES].join(', ')})`,
+      }
+    }
+    role = r
   }
 
   const hasPr = 'pr' in kvs
@@ -358,6 +388,7 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
       issue_url: kvs.issue,
       issue_number: Number.parseInt(m[3], 10),
       summary,
+      role,
     }
   }
 
@@ -377,6 +408,7 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
       repo: kvs.repo,
       pr_number: Number.parseInt(kvs.pr, 10),
       summary,
+      role,
     }
   }
 
@@ -394,6 +426,7 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
       repo: `${m[1]}/${m[2]}`,
       pr_number: Number.parseInt(m[3], 10),
       summary,
+      role,
     }
   }
 
@@ -443,6 +476,48 @@ export type Frontmatter = Record<string, FrontmatterValue>
  * Intentionally minimal — the watcher controls both ends, so we don't
  * pull a YAML lib for nested structures we don't use.
  */
+
+/**
+ * Escape a string for the double-quoted YAML scalar form we emit.
+ * Order matters: backslash MUST be escaped first so the backslash
+ * introduced by subsequent escapes (`\"`, `\n`, `\r`) is not
+ * re-escaped.
+ */
+export function escapeYamlString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+}
+
+/**
+ * Inverse of escapeYamlString. Single-pass to avoid the order trap of
+ * a multi-replace pipeline (the prior multi-replace would corrupt a
+ * literal `\n` (= backslash + n in the source string) by treating it
+ * as an escape after the leading backslash had already been doubled).
+ *
+ * Recognized escapes: `\\\\` -> `\`, `\\"` -> `"`, `\\n` -> newline,
+ * `\\r` -> CR. Unknown escapes (`\\x`) are passed through verbatim
+ * (= `\\x` stays `\\x` in the decoded string), so an unrecognized
+ * escape never silently loses the leading backslash.
+ */
+export function unescapeYamlString(s: string): string {
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    if (s[i] === '\\' && i + 1 < s.length) {
+      const next = s[i + 1]
+      if (next === '\\') out += '\\'
+      else if (next === '"') out += '"'
+      else if (next === 'n') out += '\n'
+      else if (next === 'r') out += '\r'
+      else out += `\\${next}` // unknown escape: keep verbatim (no silent drop)
+      i += 2
+    } else {
+      out += s[i]
+      i++
+    }
+  }
+  return out
+}
+
 export function serializeFrontmatter(fm: Frontmatter): string {
   const lines: string[] = []
   for (const [k, v] of Object.entries(fm)) {
@@ -451,12 +526,7 @@ export function serializeFrontmatter(fm: Frontmatter): string {
     } else if (typeof v === 'number') {
       lines.push(`${k}: ${v}`)
     } else {
-      const escaped = v
-        .replace(/\\/g, '\\\\')
-        .replace(/"/g, '\\"')
-        .replace(/\n/g, '\\n')
-        .replace(/\r/g, '\\r')
-      lines.push(`${k}: "${escaped}"`)
+      lines.push(`${k}: "${escapeYamlString(v)}"`)
     }
   }
   return lines.join('\n')
@@ -481,12 +551,7 @@ export function parseFrontmatterFile(content: string): { fm: Frontmatter; body: 
     } else if (/^-?\d+$/.test(raw)) {
       fm[k] = Number.parseInt(raw, 10)
     } else if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
-      fm[k] = raw
-        .slice(1, -1)
-        .replace(/\\"/g, '"')
-        .replace(/\\n/g, '\n')
-        .replace(/\\r/g, '\r')
-        .replace(/\\\\/g, '\\')
+      fm[k] = unescapeYamlString(raw.slice(1, -1))
     } else {
       fm[k] = raw
     }
@@ -568,13 +633,21 @@ interface Config {
   hikaruUserId: string
   hikaruDmChannel: string
   pollIntervalMs?: number
+  /**
+   * Per-trigger allowlist for [codex-review] sender. Defaults to
+   * [hikaruUserId]. Add Claude Bridge bot user_id, consultant /
+   * executor session user_ids here so completion reports can post
+   * directly to the queue without going through Hikaru's account.
+   * The other 5 prefixes remain Hikaru-only regardless of this list.
+   */
+  codexReviewSenderUserIds?: string[]
 }
 
 function loadConfig(): Config {
   if (!existsSync(CONFIG_FILE)) {
     console.error(`[watcher] missing config: ${CONFIG_FILE}`)
     console.error(
-      '[watcher] expected JSON: { "hikaruUserId": "U...", "hikaruDmChannel": "D...", "pollIntervalMs": 5000 }',
+      '[watcher] expected JSON: { "hikaruUserId": "U...", "hikaruDmChannel": "D...", "pollIntervalMs": 5000, "codexReviewSenderUserIds": ["U..."] }',
     )
     process.exit(1)
   }
@@ -585,7 +658,39 @@ function loadConfig(): Config {
   if (!/^D[A-Z0-9]+$/.test(raw.hikaruDmChannel)) {
     throw new Error(`Invalid hikaruDmChannel in config: ${raw.hikaruDmChannel}`)
   }
+  if (raw.codexReviewSenderUserIds !== undefined) {
+    if (!Array.isArray(raw.codexReviewSenderUserIds)) {
+      throw new Error('codexReviewSenderUserIds must be a string array')
+    }
+    for (const u of raw.codexReviewSenderUserIds) {
+      if (typeof u !== 'string' || !/^U[A-Z0-9]+$/.test(u)) {
+        throw new Error(`Invalid user id in codexReviewSenderUserIds: ${u}`)
+      }
+    }
+  }
   return raw
+}
+
+/**
+ * Per-trigger sender gate. Only `[codex-review]` consults the
+ * `codexReviewAllowlist`; every other trigger is Hikaru-only.
+ *
+ * The allowlist for `[codex-review]` is the resolved list (= the
+ * caller is expected to fall the config's optional list back to
+ * `[hikaruUserId]`). Returns false for any non-string userId so the
+ * gate is closed by default for malformed Slack payloads.
+ */
+export function isAllowedSender(
+  userId: string | undefined,
+  trigger: Trigger,
+  hikaruUserId: string,
+  codexReviewAllowlist: readonly string[],
+): boolean {
+  if (typeof userId !== 'string' || userId.length === 0) return false
+  if (trigger === '[codex-review]') {
+    return codexReviewAllowlist.includes(userId)
+  }
+  return userId === hikaruUserId
 }
 
 function loadBotToken(): string {
@@ -684,12 +789,15 @@ async function main(): Promise<void> {
   const config = loadConfig()
   const slack = new WebClient(loadBotToken())
   const pollIntervalMs = clampPollInterval(config.pollIntervalMs)
+  // Resolve the [codex-review] sender allowlist once at startup. Other
+  // triggers ignore this list and stay Hikaru-only via isAllowedSender.
+  const codexReviewAllowlist = config.codexReviewSenderUserIds ?? [config.hikaruUserId]
 
   let lastTs = existsSync(LAST_TS_FILE)
     ? readFileSync(LAST_TS_FILE, 'utf-8').trim()
     : String(Math.floor(Date.now() / 1000))
   console.log(
-    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} pollMs=${pollIntervalMs} lastTs=${lastTs}`,
+    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs}`,
   )
 
   async function reply(text: string, threadTs: string): Promise<void> {
@@ -857,6 +965,11 @@ async function main(): Promise<void> {
       updated.summary = parsed.summary
       updated.message_ts = ts
       updated.status = 'pending'
+      // role= on update is honored as an explicit re-classification.
+      // Without it the existing sender_role is preserved.
+      if (parsed.role) {
+        updated.sender_role = parsed.role
+      }
       const newContent = `---\n${serializeFrontmatter(updated)}\n---\n${existing.body || ''}`
       writeFileSync(existing.path, newContent)
       const entries = listQueueEntries(CODEX_REVIEW_QUEUE_DIR)
@@ -880,13 +993,18 @@ async function main(): Promise<void> {
       return
     }
 
-    // 5. Write the new entry.
+    // 5. Write the new entry. Sender role precedence: explicit
+    //    role= argument wins; otherwise derive from the sender
+    //    (hikaruUserId -> "hikaru", any other allowlisted sender ->
+    //    "agent"). All values come from the ALLOWED_ROLES set so the
+    //    field is bounded.
     const createdAt = new Date()
+    const senderRole = parsed.role ?? (userId === config.hikaruUserId ? 'hikaru' : 'agent')
     const fm: Frontmatter = {
       created_at: createdAt.toISOString(),
       source: 'slack',
       repo: parsed.repo,
-      sender_role: 'Hikaru',
+      sender_role: senderRole,
       sender_id: userId,
       chat_id: config.hikaruDmChannel,
       message_ts: ts,
@@ -945,12 +1063,23 @@ async function main(): Promise<void> {
     // conversations.history returns newest-first; flip to chronological.
     const messages = (result.messages ?? []).slice().reverse()
     for (const msg of messages) {
-      if (msg.user !== config.hikaruUserId) continue
       if (typeof msg.text !== 'string' || typeof msg.ts !== 'string') continue
       const trig = detectTrigger(msg.text)
       if (!trig) continue
+      // Per-trigger sender gate. [codex-review] uses the resolved
+      // codexReviewAllowlist; everything else stays Hikaru-only.
+      if (
+        !isAllowedSender(
+          msg.user as string | undefined,
+          trig,
+          config.hikaruUserId,
+          codexReviewAllowlist,
+        )
+      ) {
+        continue
+      }
       const threadTs = (msg.thread_ts as string | undefined) ?? msg.ts
-      console.log(`[watcher] trigger=${trig} ts=${msg.ts} thread=${threadTs}`)
+      console.log(`[watcher] trigger=${trig} ts=${msg.ts} sender=${msg.user} thread=${threadTs}`)
       try {
         await dispatch(trig, msg as SlackMessage, threadTs)
       } catch (e) {

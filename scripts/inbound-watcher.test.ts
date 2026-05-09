@@ -9,7 +9,9 @@ import {
   detectToken,
   detectTrigger,
   entryKey,
+  escapeYamlString,
   findEntryByKey,
+  isAllowedSender,
   listQueueEntries,
   parseCodexReview,
   parseFrontmatterFile,
@@ -17,6 +19,7 @@ import {
   routeTrigger,
   serializeFrontmatter,
   TRIGGERS,
+  unescapeYamlString,
 } from './inbound-watcher'
 
 // --- detectTrigger -----------------------------------------------------
@@ -496,5 +499,185 @@ describe('entryKey', () => {
     expect(entryKey({})).toBeNull()
     expect(entryKey({ repo: 'x/y' })).toBeNull()
     expect(entryKey({ pr_number: 1 })).toBeNull()
+  })
+})
+
+// --- escapeYamlString / unescapeYamlString round-trip ----------------
+
+describe('escapeYamlString / unescapeYamlString', () => {
+  // Codex review against PR #3 v1: the prior multi-replace
+  // unescape pipeline corrupted strings with literal `\n` (backslash
+  // + n, two source chars) by treating them as escapes after the
+  // leading backslash had been doubled. These tests pin the corrected
+  // single-pass unescape contract.
+  test('round-trip preserves literal `\\n` (backslash + n, NOT newline)', () => {
+    const s = 'foo\\nbar'
+    expect(s.length).toBe(8) // f o o \ n b a r
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('round-trip preserves an actual newline', () => {
+    const s = 'foo\nbar'
+    expect(s.length).toBe(7) // f o o NL b a r
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('round-trip preserves two consecutive literal backslashes', () => {
+    const s = 'a\\\\b'
+    expect(s.length).toBe(4) // a \ \ b
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('round-trip preserves literal CR', () => {
+    const s = 'a\rb'
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('round-trip preserves embedded double quotes', () => {
+    const s = 'a "quoted" b'
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('round-trip preserves a mixed payload (literal \\n + actual NL + " + \\)', () => {
+    const s = 'line1\\n\nline2 with "quote" and \\ backslash and \r tail'
+    expect(unescapeYamlString(escapeYamlString(s))).toBe(s)
+  })
+
+  test('unescape passes unknown escapes through verbatim (no silent drop)', () => {
+    expect(unescapeYamlString('foo\\xbar')).toBe('foo\\xbar')
+  })
+})
+
+describe('serializeFrontmatter / parseFrontmatterFile', () => {
+  test('summary with literal `\\n` (2 source chars) survives round-trip', () => {
+    const fm = { summary: 'foo\\nbar', status: 'pending' }
+    const ser = serializeFrontmatter(fm)
+    const parsed = parseFrontmatterFile(`---\n${ser}\n---\n`)
+    expect(parsed?.fm.summary).toBe('foo\\nbar')
+  })
+
+  test('summary with actual newline survives round-trip', () => {
+    const fm = { summary: 'line1\nline2', status: 'pending' }
+    const ser = serializeFrontmatter(fm)
+    const parsed = parseFrontmatterFile(`---\n${ser}\n---\n`)
+    expect(parsed?.fm.summary).toBe('line1\nline2')
+  })
+
+  test('summary with mixed escape chars survives round-trip', () => {
+    const fm: Record<string, string> = {
+      summary: 'a\\nb\nc"d\\\\e\rf',
+      status: 'pending',
+    }
+    const ser = serializeFrontmatter(fm)
+    const parsed = parseFrontmatterFile(`---\n${ser}\n---\n`)
+    expect(parsed?.fm.summary).toBe(fm.summary)
+  })
+})
+
+// --- isAllowedSender (per-trigger gate) ------------------------------
+
+describe('isAllowedSender', () => {
+  // Codex review against PR #3 v1: the global poll filter `msg.user
+  // !== hikaruUserId` blocked non-Hikaru senders for ALL triggers,
+  // including [codex-review]. This pins the per-trigger gate: only
+  // [codex-review] consults the codexReviewAllowlist; every other
+  // trigger stays Hikaru-only.
+  const HIKARU = 'U_HIKARU'
+  const BOT = 'U_BOT'
+  const OTHER = 'U_OTHER'
+  const allowlistWithBot = [HIKARU, BOT]
+
+  test('Hikaru can use every trigger', () => {
+    for (const t of TRIGGERS) {
+      expect(isAllowedSender(HIKARU, t, HIKARU, allowlistWithBot)).toBe(true)
+    }
+  })
+
+  test('allowlisted (non-Hikaru) sender can use [codex-review]', () => {
+    expect(isAllowedSender(BOT, '[codex-review]', HIKARU, allowlistWithBot)).toBe(true)
+  })
+
+  test('allowlisted (non-Hikaru) sender CANNOT use the 5 Hikaru-only triggers', () => {
+    expect(isAllowedSender(BOT, '[abort]', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, '[abort cleanup]', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, '[abort-test]', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, 'status?', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, 'prs?', HIKARU, allowlistWithBot)).toBe(false)
+  })
+
+  test('non-allowlisted sender is denied for every trigger', () => {
+    for (const t of TRIGGERS) {
+      expect(isAllowedSender(OTHER, t, HIKARU, allowlistWithBot)).toBe(false)
+    }
+  })
+
+  test('undefined / empty user is denied (gate closed by default)', () => {
+    expect(isAllowedSender(undefined, '[codex-review]', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(undefined, '[abort]', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender('', '[codex-review]', HIKARU, allowlistWithBot)).toBe(false)
+  })
+
+  test('default allowlist [hikaruUserId] keeps [codex-review] Hikaru-only', () => {
+    // When the operator does not configure codexReviewSenderUserIds,
+    // the watcher resolves the list to [hikaruUserId]. This pins the
+    // resulting per-trigger behavior == old global gate.
+    const onlyHikaru = [HIKARU]
+    expect(isAllowedSender(HIKARU, '[codex-review]', HIKARU, onlyHikaru)).toBe(true)
+    expect(isAllowedSender(BOT, '[codex-review]', HIKARU, onlyHikaru)).toBe(false)
+    expect(isAllowedSender(OTHER, '[codex-review]', HIKARU, onlyHikaru)).toBe(false)
+  })
+})
+
+// --- parseCodexReview role= ------------------------------------------
+
+describe('parseCodexReview role=', () => {
+  test('valid roles parse and lowercase canonicalize', () => {
+    for (const role of ['hikaru', 'consultant', 'executor', 'agent']) {
+      const r = parseCodexReview(
+        `[codex-review] pr=https://github.com/x/y/pull/1 role=${role} summary=test`,
+      )
+      expect('error' in r).toBe(false)
+      if ('error' in r) continue
+      expect(r.role).toBe(role)
+    }
+  })
+
+  test('case-insensitive role value', () => {
+    const r = parseCodexReview(
+      '[codex-review] pr=https://github.com/x/y/pull/1 role=CONSULTANT summary=test',
+    )
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.role).toBe('consultant')
+  })
+
+  test('invalid role -> error', () => {
+    const r = parseCodexReview(
+      '[codex-review] pr=https://github.com/x/y/pull/1 role=admin summary=test',
+    )
+    expect('error' in r).toBe(true)
+  })
+
+  test('omitted role -> undefined in parsed (handler will derive default)', () => {
+    const r = parseCodexReview('[codex-review] pr=https://github.com/x/y/pull/1 summary=test')
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.role).toBeUndefined()
+  })
+
+  test('role= works in all 3 forms', () => {
+    const a = parseCodexReview(
+      '[codex-review] pr=https://github.com/x/y/pull/1 role=executor summary=A',
+    )
+    const b = parseCodexReview(
+      '[codex-review] issue=https://github.com/x/y/issues/1 role=consultant summary=B',
+    )
+    const c = parseCodexReview('[codex-review] repo=x/y pr=2 role=agent summary=C')
+    expect('error' in a).toBe(false)
+    expect('error' in b).toBe(false)
+    expect('error' in c).toBe(false)
+    if (!('error' in a)) expect(a.role).toBe('executor')
+    if (!('error' in b)) expect(b.role).toBe('consultant')
+    if (!('error' in c)) expect(c.role).toBe('agent')
   })
 })
