@@ -128,6 +128,7 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `scripts/harness-hash.sh` — tamper-detect pinned artifacts (mirrored from skill)
 - `scripts/bias-count.sh` — test-bias pattern scanner (mirrored from skill with pipefail fix)
 - `scripts/policy-validate.ts` — CLI wrapper around `parsePolicyRules` + `detectShadowing` + `detectBroadAutoApprove` used by `/slack-channel:policy`
+- `scripts/start-bridge-prod.ps1` / `scripts/start-exec-passive.ps1` / `scripts/start-bridge-dev.ps1` — operator launchers for prod / passive / dev sessions. `scripts/claude-bridge-disabled.ps1` is the legacy alias for the passive launcher. Operating model: [`docs/environment-separation.md`](docs/environment-separation.md).
 
 ### Skills & docs
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
