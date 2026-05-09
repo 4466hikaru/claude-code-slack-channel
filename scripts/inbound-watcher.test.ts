@@ -728,6 +728,96 @@ describe('stripSlackLinkWrap', () => {
   })
 })
 
+// --- new bare-word triggers (bd ccsc-81q approved dispatch) ---------
+
+describe('detectTrigger including bare-word triggers', () => {
+  // Codex review against PR #5 (= bd ccsc-81q): adding bare-word
+  // triggers `ok` / `approve` / `cancel` requires word-boundary
+  // checks so "okay" / "approver" do not accidentally fire. These
+  // tests pin the boundary contract.
+  test('ok / approve / cancel match as standalone words', () => {
+    expect(detectTrigger('ok')).toBe('ok')
+    expect(detectTrigger('OK')).toBe('ok')
+    expect(detectTrigger('Ok')).toBe('ok')
+    expect(detectTrigger('approve d1')).toBe('approve')
+    expect(detectTrigger('Approve abc')).toBe('approve')
+    expect(detectTrigger('cancel d1')).toBe('cancel')
+    expect(detectTrigger('CANCEL d1')).toBe('cancel')
+    expect(detectTrigger('pending?')).toBe('pending?')
+  })
+
+  test('word-boundary protects against false positives', () => {
+    expect(detectTrigger('okay maybe')).toBeNull()
+    expect(detectTrigger('okie dokie')).toBeNull()
+    expect(detectTrigger('approver agent')).toBeNull()
+    expect(detectTrigger('cancelling now')).toBeNull()
+  })
+
+  test('non-letter terminators accepted (whitespace, EOL, punctuation)', () => {
+    expect(detectTrigger('ok ')).toBe('ok')
+    expect(detectTrigger('ok\n')).toBe('ok')
+    expect(detectTrigger('ok!')).toBe('ok')
+    expect(detectTrigger('ok.')).toBe('ok')
+    expect(detectTrigger('ok,')).toBe('ok')
+  })
+
+  test('existing bracketed and `?`-suffixed triggers unchanged by boundary fix', () => {
+    expect(detectTrigger('[abort]extra')).toBe('[abort]')
+    expect(detectTrigger('status?extra')).toBe('status?')
+    expect(detectTrigger('prs?extra')).toBe('prs?')
+  })
+})
+
+describe('TRIGGERS includes new bare-word triggers', () => {
+  test('ok / approve / cancel / pending? are in TRIGGERS', () => {
+    expect(TRIGGERS.indexOf('ok')).toBeGreaterThanOrEqual(0)
+    expect(TRIGGERS.indexOf('approve')).toBeGreaterThanOrEqual(0)
+    expect(TRIGGERS.indexOf('cancel')).toBeGreaterThanOrEqual(0)
+    expect(TRIGGERS.indexOf('pending?')).toBeGreaterThanOrEqual(0)
+  })
+})
+
+describe('routeTrigger covers approved-dispatch verbs', () => {
+  test('ok -> dispatch-ok', () => {
+    expect(routeTrigger('ok')).toBe('dispatch-ok')
+  })
+  test('approve -> dispatch-approve', () => {
+    expect(routeTrigger('approve')).toBe('dispatch-approve')
+  })
+  test('cancel -> dispatch-cancel', () => {
+    expect(routeTrigger('cancel')).toBe('dispatch-cancel')
+  })
+  test('pending? -> dispatch-pending', () => {
+    expect(routeTrigger('pending?')).toBe('dispatch-pending')
+  })
+})
+
+describe('isAllowedSender for approved-dispatch verbs', () => {
+  // bd ccsc-81q: bare OK / approve / cancel / pending? must be
+  // Hikaru-only (= NOT bot-allowlisted). Only [codex-review] is on
+  // the codexReviewAllowlist path.
+  const HIKARU = 'U_HIKARU'
+  const BOT = 'U_BOT'
+  const allowlistWithBot = [HIKARU, BOT]
+
+  test('Hikaru can use the dispatch verbs', () => {
+    expect(isAllowedSender(HIKARU, 'ok', HIKARU, allowlistWithBot)).toBe(true)
+    expect(isAllowedSender(HIKARU, 'approve', HIKARU, allowlistWithBot)).toBe(true)
+    expect(isAllowedSender(HIKARU, 'cancel', HIKARU, allowlistWithBot)).toBe(true)
+    expect(isAllowedSender(HIKARU, 'pending?', HIKARU, allowlistWithBot)).toBe(true)
+  })
+
+  test('Bot/agent on codex-review allowlist CANNOT use dispatch verbs', () => {
+    expect(isAllowedSender(BOT, 'ok', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, 'approve', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, 'cancel', HIKARU, allowlistWithBot)).toBe(false)
+    expect(isAllowedSender(BOT, 'pending?', HIKARU, allowlistWithBot)).toBe(false)
+    // [codex-review] still allowed for bot — pinning that the gates
+    // remain orthogonal.
+    expect(isAllowedSender(BOT, '[codex-review]', HIKARU, allowlistWithBot)).toBe(true)
+  })
+})
+
 describe('parseCodexReview through Slack mrkdwn URL wrap', () => {
   test('Form A: pr=<https://...> (Slack auto-link wrapped) parses', () => {
     const r = parseCodexReview(
