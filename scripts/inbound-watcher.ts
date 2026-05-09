@@ -254,6 +254,62 @@ export function detectToken(text: string): string | null {
   return null
 }
 
+/**
+ * Split the head args of a `[codex-review]` message on whitespace,
+ * but treat `<...>` as a single token so a Slack mrkdwn auto-link
+ * with a display text (e.g. `<https://x/y|PR #1>`) is not broken
+ * mid-URL on the embedded space.
+ *
+ * Empty tokens (= consecutive whitespace) are dropped.
+ */
+function tokenizeHeadArgs(s: string): string[] {
+  const tokens: string[] = []
+  let cur = ''
+  let inAngle = false
+  for (const ch of s) {
+    if (ch === '<') {
+      inAngle = true
+      cur += ch
+    } else if (ch === '>') {
+      inAngle = false
+      cur += ch
+    } else if (!inAngle && /\s/.test(ch)) {
+      if (cur.length > 0) {
+        tokens.push(cur)
+        cur = ''
+      }
+    } else {
+      cur += ch
+    }
+  }
+  if (cur.length > 0) tokens.push(cur)
+  return tokens
+}
+
+/**
+ * Strip Slack mrkdwn URL auto-link wrappers from a value.
+ *
+ * Slack's mrkdwn renders any URL in a message as a clickable link and
+ * stores it as `<url>` (or `<url|display text>`) when fetched via
+ * conversations.history. The watcher's parser must accept both the
+ * raw URL and the wrapped form so a `[codex-review] pr=https://...`
+ * message survives the round trip through Slack regardless of who
+ * typed it.
+ *
+ * Only values that look like a wrapped URL (`<http://...>` or
+ * `<https://...>`, optionally with `|display`) are unwrapped. Other
+ * values pass through unchanged so non-URL inputs (e.g. Form C's
+ * `repo=owner/name`, `pr=5`) are not affected.
+ */
+export function stripSlackLinkWrap(s: string): string {
+  if (/^<https?:\/\/[^>|\s]+(\|[^>]*)?>$/.test(s)) {
+    const inner = s.slice(1, -1)
+    const pipeIdx = inner.indexOf('|')
+    return pipeIdx >= 0 ? inner.slice(0, pipeIdx) : inner
+  }
+  return s
+}
+
 // --- [codex-review] parser (exported for testing) ---------------------
 
 export type CodexReviewParsed =
@@ -328,10 +384,12 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
     return { error: 'empty summary= value' }
   }
 
-  // Parse head part as space-separated key=value pairs (URLs and
-  // owner/repo do not contain spaces, so simple split is safe).
+  // Parse head part as space-separated key=value pairs. Slack mrkdwn
+  // can wrap URLs as `<url|display text>` where the display text may
+  // contain whitespace, so a naive `.split(/\s+/)` would break the
+  // token mid-URL. Tokenize while respecting `<...>` boundaries.
   const kvs: Record<string, string> = {}
-  for (const tok of headPart.split(/\s+/).filter((s) => s.length > 0)) {
+  for (const tok of tokenizeHeadArgs(headPart)) {
     const eq = tok.indexOf('=')
     if (eq < 0) {
       return { error: `unknown token (no =): ${tok}` }
@@ -374,9 +432,12 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
     return { error: 'issue= cannot be combined with pr= or repo=' }
   }
 
-  // Form B: issue=<github-issue-url> alone.
+  // Form B: issue=<github-issue-url> alone. Slack mrkdwn auto-link
+  // wraps URLs as <url>; strip first so the same regex matches both
+  // raw and wrapped forms.
   if (hasIssue) {
-    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:[?#].*)?$/.exec(kvs.issue)
+    const issueUrl = stripSlackLinkWrap(kvs.issue)
+    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:[?#].*)?$/.exec(issueUrl)
     if (!m) {
       return {
         error: 'issue= must be a GitHub issue URL (https://github.com/<owner>/<repo>/issues/<n>)',
@@ -385,7 +446,7 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
     return {
       form: 'issue-url',
       repo: `${m[1]}/${m[2]}`,
-      issue_url: kvs.issue,
+      issue_url: issueUrl,
       issue_number: Number.parseInt(m[3], 10),
       summary,
       role,
@@ -412,9 +473,13 @@ export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewE
     }
   }
 
-  // Form A: pr=<github-pr-url> alone.
+  // Form A: pr=<github-pr-url> alone. Strip Slack mrkdwn auto-link
+  // wrappers (<url> or <url|display>) before matching the URL regex
+  // so the same parser works for human typists and Slack-rendered
+  // messages.
   if (hasPr) {
-    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[?#].*)?$/.exec(kvs.pr)
+    const prUrl = stripSlackLinkWrap(kvs.pr)
+    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[?#].*)?$/.exec(prUrl)
     if (!m) {
       return {
         error:

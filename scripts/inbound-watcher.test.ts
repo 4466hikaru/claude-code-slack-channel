@@ -18,6 +18,7 @@ import {
   queueFilenameFor,
   routeTrigger,
   serializeFrontmatter,
+  stripSlackLinkWrap,
   TRIGGERS,
   unescapeYamlString,
 } from './inbound-watcher'
@@ -679,5 +680,108 @@ describe('parseCodexReview role=', () => {
     if (!('error' in a)) expect(a.role).toBe('executor')
     if (!('error' in b)) expect(b.role).toBe('consultant')
     if (!('error' in c)) expect(c.role).toBe('agent')
+  })
+})
+
+// --- stripSlackLinkWrap (Slack mrkdwn URL auto-link bug fix) ---------
+
+describe('stripSlackLinkWrap', () => {
+  // Codex review post-merge runtime check on PR #3: Slack stores any
+  // URL in a message body as `<url>` (or `<url|display text>`) when
+  // fetched via conversations.history. Without this strip, every
+  // pr=<github-url> message Slack delivers would fail the URL regex
+  // and reply with format error. Pin both the unwrap behavior and the
+  // pass-through behavior for non-URL values.
+  test('unwraps <url>', () => {
+    expect(stripSlackLinkWrap('<https://github.com/x/y/pull/1>')).toBe(
+      'https://github.com/x/y/pull/1',
+    )
+    expect(stripSlackLinkWrap('<http://example.com/path?q=1>')).toBe('http://example.com/path?q=1')
+  })
+
+  test('unwraps <url|display> by taking the URL part', () => {
+    expect(stripSlackLinkWrap('<https://github.com/x/y/pull/1|PR #1>')).toBe(
+      'https://github.com/x/y/pull/1',
+    )
+    expect(stripSlackLinkWrap('<https://example.com|click here>')).toBe('https://example.com')
+  })
+
+  test('passes plain URLs through unchanged (backward compat)', () => {
+    expect(stripSlackLinkWrap('https://github.com/x/y/pull/1')).toBe(
+      'https://github.com/x/y/pull/1',
+    )
+  })
+
+  test('passes non-URL values through unchanged (Form C protections)', () => {
+    expect(stripSlackLinkWrap('4466hikaru/claude-code-slack-channel')).toBe(
+      '4466hikaru/claude-code-slack-channel',
+    )
+    expect(stripSlackLinkWrap('5')).toBe('5')
+    expect(stripSlackLinkWrap('<not-a-url>')).toBe('<not-a-url>')
+    expect(stripSlackLinkWrap('<>')).toBe('<>')
+    expect(stripSlackLinkWrap('')).toBe('')
+  })
+
+  test('does not unwrap partial brackets', () => {
+    expect(stripSlackLinkWrap('<https://x.example/')).toBe('<https://x.example/')
+    expect(stripSlackLinkWrap('https://x.example/>')).toBe('https://x.example/>')
+  })
+})
+
+describe('parseCodexReview through Slack mrkdwn URL wrap', () => {
+  test('Form A: pr=<https://...> (Slack auto-link wrapped) parses', () => {
+    const r = parseCodexReview(
+      '[codex-review] pr=<https://github.com/4466hikaru/birth-kaitori/pull/12> summary=via slack wrap',
+    )
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.form).toBe('pr-url')
+    expect(r.repo).toBe('4466hikaru/birth-kaitori')
+    if (r.form !== 'pr-url') return
+    expect(r.pr_number).toBe(12)
+  })
+
+  test('Form A: pr=<url|display> (mrkdwn with display text) parses', () => {
+    const r = parseCodexReview(
+      '[codex-review] pr=<https://github.com/x/y/pull/1|PR #1> summary=display label',
+    )
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.form).toBe('pr-url')
+    expect(r.repo).toBe('x/y')
+    if (r.form !== 'pr-url') return
+    expect(r.pr_number).toBe(1)
+  })
+
+  test('Form B: issue=<https://...> (wrapped) parses', () => {
+    const r = parseCodexReview(
+      '[codex-review] issue=<https://github.com/4466hikaru/birth-kaitori/issues/9> summary=cleanup',
+    )
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.form).toBe('issue-url')
+    expect(r.repo).toBe('4466hikaru/birth-kaitori')
+    if (r.form !== 'issue-url') return
+    expect(r.issue_number).toBe(9)
+    // The stored issue_url is the unwrapped form so downstream
+    // entryKey() and audit consumers see a canonical URL.
+    expect(r.issue_url).toBe('https://github.com/4466hikaru/birth-kaitori/issues/9')
+  })
+
+  test('Form A: plain pr=<no-wrap> URL still parses (regression for human typists)', () => {
+    const r = parseCodexReview('[codex-review] pr=https://github.com/x/y/pull/1 summary=plain')
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    if (r.form !== 'pr-url') return
+    expect(r.pr_number).toBe(1)
+  })
+
+  test('Form C: repo=x/y pr=5 (numeric, not URL) ignores wrap logic', () => {
+    const r = parseCodexReview('[codex-review] repo=x/y pr=5 summary=numeric pr unaffected')
+    expect('error' in r).toBe(false)
+    if ('error' in r) return
+    expect(r.form).toBe('repo-pr')
+    if (r.form !== 'repo-pr') return
+    expect(r.pr_number).toBe(5)
   })
 })
