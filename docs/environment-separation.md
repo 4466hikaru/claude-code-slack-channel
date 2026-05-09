@@ -143,6 +143,20 @@ Either path produces the same end state: `process.env` in `server.ts`
 has the right `SLACK_BRIDGE_DISABLE` / `SLACK_STATE_DIR` value at boot,
 and the matching state dir exists with the expected files.
 
+## Inbound auto-processing (separate concern)
+
+The prod bridge delivers each inbound DM to Claude Code via an MCP
+notification. MCP notifications do **not** auto-wake an idle Claude
+Code session — the message lands in the session context but no
+response is generated until a user turn fires. For a small set of
+allowlisted DM prefixes (`[abort-test]`, `[abort cleanup]`, `[abort]`,
+`status?`, `prs?`) we run a separate watcher that bypasses Claude
+Code entirely. See [`inbound-auto-processing.md`](inbound-auto-processing.md)
+for the architecture, configuration, and end-to-end verification.
+
+The watcher uses Web API only (no Socket Mode), so it is **safe to
+run alongside `start-bridge-prod.ps1`** and obeys invariant 1.
+
 ## Compatibility
 
 - `scripts/claude-bridge-disabled.ps1` is preserved as an alias that
