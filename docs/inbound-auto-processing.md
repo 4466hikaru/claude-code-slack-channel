@@ -13,9 +13,9 @@ Claude Code session as a `<channel source="slack" ...>` tag in its
 context, but **Claude Code does not generate a response without a
 user turn**. An idle session stays idle.
 
-Hikaru wants `[abort-test]`, `[abort]`, `[abort cleanup]`, `status?`,
-and `prs?` to be processed immediately. For these specific prefixes
-we run a separate watcher process that polls Slack Web API directly
+For five specific prefixes — `[abort-test]`, `[abort]`,
+`[abort cleanup]`, `status?`, and `prs?` — we want immediate scripted
+responses. A separate watcher process polls Slack Web API directly
 and replies via `chat.postMessage`. Claude Code is bypassed entirely.
 
 This is **not** approved-dispatch (no Block Kit confirmation, no
@@ -48,17 +48,44 @@ Mode, so the prod bridge keeps its singular connection.
 
 ## Allowlisted triggers
 
-| trigger | action | reply |
+| trigger | action | reply (success path) |
 |---|---|---|
-| `[abort-test]` | `touch` + verify + `rm -f` cycle on the abort flag | `abort-test 完了、cleanup OK` (or specific failure message) |
-| `[abort cleanup]` | `rm -f` on the abort flag (if present) | `abort cleanup OK` (or `nothing to do`) |
-| `[abort]` | alias for `[abort cleanup]` | same as `[abort cleanup]` |
-| `status?` | report watcher / state dir / abort-flag presence | multi-line status text |
-| `prs?` | run `gh pr list --repo 4466hikaru/claude-code-slack-channel --state open` | formatted PR list |
+| `[abort-test]` | `touch` + verify + `rm -f` + verify-absent on the abort flag | `abort-test 完了、cleanup OK` |
+| `[abort]` | `touch` + verify on the abort flag (**create / raise**) | `abort flag created at <path>` |
+| `[abort cleanup]` | `rm -f` + verify-absent on the abort flag | `abort cleanup OK` |
+| `status?` | report watcher / abort-flag / open PR count / blocker | 5-line status text |
+| `prs?` | run `gh pr list --state open` against the 3 active repos and merge results | formatted PR list, max 5 entries total |
 
 Prefix matching is `startsWith` after trimming leading whitespace.
-Order is significant: `[abort cleanup]` is checked before `[abort]`
-so the longer prefix wins.
+**Order matters**: `[abort cleanup]` is checked before `[abort]` so
+the longer prefix wins on a message like `[abort cleanup] foo`. The
+`TRIGGERS` array order **and** the `routeTrigger` mapping are pinned
+by `scripts/inbound-watcher.test.ts` so the `[abort]` /
+`[abort cleanup]` semantics cannot accidentally flip back to the
+v1-PR-#2 buggy alias-to-cleanup behavior.
+
+### `[abort]` vs `[abort cleanup]` (do not confuse)
+
+- `[abort]` **raises** the flag. It is the operational "halt" command.
+  Idempotent: if the flag is already present, the handler replies
+  `no-op` and does nothing.
+- `[abort cleanup]` **removes** the flag. It is the recovery command.
+  Idempotent: if the flag is absent, the handler replies
+  `nothing to do`.
+- `[abort-test]` exercises both, leaving the flag absent on success.
+
+### Active repos surveyed by `prs?` and `status?`
+
+```
+4466hikaru/hikaru-agent-knowledge
+4466hikaru/birth-kaitori
+4466hikaru/claude-code-slack-channel
+```
+
+`prs?` lists at most **5 PRs total** across the three repos (in the
+listed order). If more are open, the handler appends `(+N more)`. If
+`gh` errors on a repo, the watcher reports the partial result with a
+warning line.
 
 ## Authorization
 
@@ -70,17 +97,24 @@ authorization scope.
 
 ## Destructive ops
 
-The watcher's only authorized destructive operation is `rm -f` on
-this exact path:
+The watcher manipulates exactly **one path**:
 
 ```
 /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2
 ```
 
-Hardcoded as a `const ABORT_FLAG` in
+Hardcoded as `const ABORT_FLAG` in
 [`scripts/inbound-watcher.ts`](../scripts/inbound-watcher.ts), **not**
-overridable from config or env. No other rm, no `rm -rf`, no other
-destructive ops are reachable from any trigger.
+overridable from config or env. Operations on this path:
+
+| trigger | op |
+|---|---|
+| `[abort]` | `touch` (write — create the flag) |
+| `[abort-test]` | `touch` then `rm -f` (write + remove, paired) |
+| `[abort cleanup]` | `rm -f` (remove the flag) |
+
+No other rm, no `rm -rf`, no other writes, no other paths reachable
+from any trigger.
 
 ## Configuration
 
@@ -99,7 +133,12 @@ Create `$SLACK_STATE_DIR/inbound-watcher.config.json` (default
 |---|---|---|
 | `hikaruUserId` | yes | `U…` Slack user id of the only allowed sender |
 | `hikaruDmChannel` | yes | `D…` Slack DM channel id (find via Slack UI, or `conversations.list types=im`) |
-| `pollIntervalMs` | no | poll cadence; defaults to `5000` |
+| `pollIntervalMs` | no | poll cadence; must be in `[3000, 60000]` |
+
+Out-of-range or non-finite `pollIntervalMs` (anything outside
+`[3000, 60000]`, `NaN`, or infinity) is replaced with the default
+`5000` and a stderr warning is logged. See `clampPollInterval` in
+the script.
 
 The watcher loads its bot token from `$SLACK_STATE_DIR/.env`
 (`SLACK_BOT_TOKEN=…`) — the prod bridge's `.env`, read-only.
@@ -142,21 +181,31 @@ Run alongside the prod bridge — they don't conflict.
    ```
    Expected stdout (single line):
    `[watcher] starting; channel=D... sender=U... pollMs=5000 lastTs=...`
-4. From Slack DM, send: `[abort-test]`
-5. Within `pollIntervalMs`, the watcher logs:
-   ```
-   [watcher] trigger=[abort-test] ts=... thread=...
-   ```
-   And replies in the DM thread:
-   ```
-   abort-test 完了、cleanup OK
-   ```
-6. Verify cleanup — the abort flag must not exist:
+4. From Slack DM, send: `[abort-test]`. Within `pollIntervalMs` the
+   watcher logs `[watcher] trigger=[abort-test] ...` and replies in
+   the DM thread `abort-test 完了、cleanup OK`. Verify cleanup:
    ```bash
    test ! -e /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2 && echo OK
    ```
+5. From Slack DM, send: `[abort]`. Watcher replies
+   `abort flag created at /home/hikaru/.../abort-lv2`. Verify:
+   ```bash
+   test -e /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2 && echo OK
+   ```
+6. From Slack DM, send: `[abort cleanup]`. Watcher replies
+   `abort cleanup OK`. Verify:
+   ```bash
+   test ! -e /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2 && echo OK
+   ```
+7. From Slack DM, send: `status?`. Watcher replies with 5 lines:
+   `watcher: alive`, `abort flag: absent (or PRESENT) (...)`,
+   `open PRs: <count>` or `unknown (gh error...)`, `blocker: unknown`.
+8. From Slack DM, send: `prs?`. Watcher replies with up to 5 open PRs
+   tagged `[hikaru-agent-knowledge]` / `[birth-kaitori]` /
+   `[claude-code-slack-channel]`, with `(+N more)` appended if there
+   are more.
 
-If step 5 doesn't fire, capture watcher stdout and `cat
+If any step fails, capture watcher stdout and `cat
 $SLACK_STATE_DIR/inbound-watcher.last-ts` and route via handoff /
 Issue.
 
@@ -170,8 +219,11 @@ Issue.
   hash-chained audit log (`journal.ts`) only records the bridge's own
   events. The watcher logs to its own stdout and the Slack thread —
   treat those as the trail.
+- **`status?` blocker is `unknown`.** No detection mechanism is
+  implemented in this iteration. Blocker reporting will be added when
+  a clear signal source exists (= a follow-up).
 - **WSL-only host.** The hardcoded abort-flag path assumes WSL
   semantics. Running the watcher on Windows native is not in scope
   for this iteration.
 - **Polling, not push.** Latency is bounded by `pollIntervalMs`
-  (default 5 s).
+  (default 5 s; clamped to `[3000, 60000]`).
