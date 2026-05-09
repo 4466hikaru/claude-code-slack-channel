@@ -21,7 +21,9 @@
  * $SLACK_STATE_DIR/.env on the watcher's side); concurrent Web API
  * calls under a single bot identity are fine on Slack's side.
  *
- * Allowlisted triggers
+ * Allowlisted triggers (case-insensitive prefix match per the PR #8
+ * Slack ops convention; the canonical lowercase form below is what is
+ * returned to callers regardless of how the user typed it)
  *   [abort-test]    -> touch + verify + rm -f + verify cycle on the
  *                      abort flag; reply "abort-test 完了、cleanup OK"
  *   [abort]         -> touch + verify on the abort flag (CREATE);
@@ -113,11 +115,18 @@ export type TriggerAction =
 
 /**
  * Detect the trigger prefix at the start of a message body.
+ *
+ * Case-insensitive (PR #8 Slack ops convention): the input text is
+ * lowercased before comparison, but the returned value is always the
+ * canonical lowercase Trigger from TRIGGERS, so callers see the same
+ * string regardless of how the user typed it (`[ABORT-TEST]`,
+ * `[Abort-Test]`, and `[abort-test]` all resolve to `[abort-test]`).
+ *
  * Order matters: '[abort cleanup]' is checked before '[abort]' so the
  * longer prefix wins on a message like "[abort cleanup] foo".
  */
 export function detectTrigger(text: string): Trigger | null {
-  const t = text.trim()
+  const t = text.trim().toLowerCase()
   for (const trig of TRIGGERS) {
     if (t.startsWith(trig)) return trig
   }

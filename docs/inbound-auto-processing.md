@@ -56,9 +56,12 @@ Mode, so the prod bridge keeps its singular connection.
 | `status?` | report watcher / abort-flag / open PR count / blocker | 5-line status text |
 | `prs?` | run `gh pr list --state open` against the 3 active repos and merge results | formatted PR list, max 5 entries total |
 
-Prefix matching is `startsWith` after trimming leading whitespace.
-**Order matters**: `[abort cleanup]` is checked before `[abort]` so
-the longer prefix wins on a message like `[abort cleanup] foo`. The
+Prefix matching is `startsWith` after **trimming leading whitespace
+and lowercasing the input** (PR #8 Slack ops convention:
+case-insensitive). `[ABORT-TEST]` / `[Abort-Test]` / `[abort-test]`
+all resolve to the same canonical lowercase trigger. **Order
+matters**: `[abort cleanup]` is checked before `[abort]` so the
+longer prefix wins on a message like `[abort cleanup] foo`. The
 `TRIGGERS` array order **and** the `routeTrigger` mapping are pinned
 by `scripts/inbound-watcher.test.ts` so the `[abort]` /
 `[abort cleanup]` semantics cannot accidentally flip back to the

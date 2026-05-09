@@ -39,7 +39,25 @@ describe('detectTrigger', () => {
     expect(detectTrigger('the [abort-test] in the middle')).toBeNull()
     expect(detectTrigger('')).toBeNull()
     expect(detectTrigger('   ')).toBeNull()
-    expect(detectTrigger('Status?')).toBeNull() // case-sensitive
+  })
+
+  test('case-insensitive prefix match (PR #8 ops convention)', () => {
+    // Returned value is the canonical lowercase Trigger regardless of
+    // how the user typed the prefix.
+    expect(detectTrigger('[ABORT-TEST]')).toBe('[abort-test]')
+    expect(detectTrigger('[Abort-Test]')).toBe('[abort-test]')
+    expect(detectTrigger('[ABORT]')).toBe('[abort]')
+    expect(detectTrigger('[ABORT CLEANUP]')).toBe('[abort cleanup]')
+    expect(detectTrigger('[Abort Cleanup]')).toBe('[abort cleanup]')
+    expect(detectTrigger('STATUS?')).toBe('status?')
+    expect(detectTrigger('Status?')).toBe('status?')
+    expect(detectTrigger('PRS?')).toBe('prs?')
+    expect(detectTrigger('Prs?')).toBe('prs?')
+  })
+
+  test('case-insensitive combined with leading whitespace', () => {
+    expect(detectTrigger('  [ABORT-TEST]')).toBe('[abort-test]')
+    expect(detectTrigger('\n\nSTATUS? please')).toBe('status?')
   })
 })
 
