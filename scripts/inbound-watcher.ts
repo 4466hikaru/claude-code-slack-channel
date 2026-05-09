@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+
 /**
  * scripts/inbound-watcher.ts
  *
@@ -31,6 +32,14 @@
  *                      abort flag, it does NOT clean up. Cleanup is the
  *                      separate [abort cleanup] command.
  *   [abort cleanup] -> rm -f + verify-absent on the abort flag; reply
+ *   [codex-review]  -> parse args (3 forms: pr=<url>, issue=<url>,
+ *                      repo=<owner/repo> pr=<number>) + summary=<text>;
+ *                      reject token-like raw secrets; write/update YAML
+ *                      frontmatter file under the absolute queue dir
+ *                      `/home/hikaru/projects/hikaru-agent-knowledge/handoff/codex-review-queue/`;
+ *                      cap pending+blocked at 50, warn above 20.
+ *                      Phase 1 = queue WRITE only. Codex automation /
+ *                      review / merge are out of scope for this Phase.
  *   status?         -> watcher alive / abort-flag presence / open PR
  *                      count across the 3 active repos / blocker
  *                      (`unknown` until a detection mechanism exists)
@@ -40,18 +49,24 @@
  * Handler routing is pinned by routeTrigger() + the test file so that
  * the [abort] / [abort cleanup] semantics cannot accidentally flip.
  *
- * Authorization: only messages whose Slack `user` equals the
- * configured hikaruUserId are honored. Other senders are silently
- * ignored.
+ * Authorization: per-trigger gate.
+ *   - `[abort-test]` / `[abort]` / `[abort cleanup]` / `status?` /
+ *     `prs?` are Hikaru-only (sender must equal `hikaruUserId`).
+ *   - `[codex-review]` accepts any sender on the allowlist
+ *     `codexReviewSenderUserIds` (default `[hikaruUserId]`). This
+ *     lets bot / consultant / executor sessions push completion
+ *     reports to the queue without going through Hikaru's account.
+ *   Other senders are silently ignored at the gate.
  *
- * Destructive ops: the watcher manipulates ONE path only:
+ * Destructive ops: the watcher manipulates ONE flag path only:
  *   /home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2
  * It is touched by [abort] and [abort-test] (write), and removed by
  * [abort cleanup] and [abort-test] (rm -f). The path is a const, not
- * overridable from config or env.
+ * overridable from config or env. The codex-review queue dir is a
+ * separate write-only path (no rm).
  *
  * State files (in $SLACK_STATE_DIR)
- *   inbound-watcher.config.json   required: { hikaruUserId, hikaruDmChannel, pollIntervalMs? }
+ *   inbound-watcher.config.json   required: { hikaruUserId, hikaruDmChannel, pollIntervalMs?, codexReviewSenderUserIds? }
  *   inbound-watcher.last-ts       persisted last-seen Slack ts
  *   inbound-watcher.pid           single-instance lockfile
  *
@@ -59,16 +74,22 @@
  * pollIntervalMs).
  */
 
-import { WebClient } from '@slack/web-api'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { WebClient } from '@slack/web-api'
 
 // --- constants --------------------------------------------------------
 
-const STATE_DIR =
-  process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'channels', 'slack')
+const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'channels', 'slack')
 const ENV_FILE = join(STATE_DIR, '.env')
 const CONFIG_FILE = join(STATE_DIR, 'inbound-watcher.config.json')
 const LAST_TS_FILE = join(STATE_DIR, 'inbound-watcher.last-ts')
@@ -76,8 +97,23 @@ const LOCK_FILE = join(STATE_DIR, 'inbound-watcher.pid')
 
 // Hardcoded: the single destructive target the watcher is authorized
 // to manipulate. Not env-configurable by design.
-const ABORT_FLAG =
-  '/home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2'
+const ABORT_FLAG = '/home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-lv2'
+
+// Hardcoded absolute path of the codex-review queue dir (Phase 1 spec
+// from bd ccsc-9hm). Created on first write, never removed by the
+// watcher. NOT env-configurable in production.
+const CODEX_REVIEW_QUEUE_DIR =
+  '/home/hikaru/projects/hikaru-agent-knowledge/handoff/codex-review-queue'
+
+// Queue size caps for [codex-review]. Counts pending + blocked entries
+// only (reviewed entries are excluded by countActiveEntries()).
+const MAX_QUEUE_PENDING = 50
+const WARN_QUEUE_PENDING = 20
+
+// Allowed values for the optional `role=` argument on [codex-review].
+// `hikaru` is the implicit default when sender == hikaruUserId; `agent`
+// is the implicit default for any other allowlisted sender.
+const ALLOWED_ROLES = new Set(['hikaru', 'consultant', 'executor', 'agent'])
 
 // Repos surveyed by `prs?` and `status?`. Order is the listing order
 // in `prs?` output. Total result rows are capped at PR_LIMIT.
@@ -101,6 +137,7 @@ export const TRIGGERS = [
   '[abort-test]',
   '[abort cleanup]',
   '[abort]',
+  '[codex-review]',
   'status?',
   'prs?',
 ] as const
@@ -110,6 +147,7 @@ export type TriggerAction =
   | 'abort-test'
   | 'abort-create'
   | 'abort-cleanup'
+  | 'codex-review-queue'
   | 'status'
   | 'prs'
 
@@ -136,11 +174,13 @@ export function detectTrigger(text: string): Trigger | null {
 /**
  * Map a trigger to its action name. Pinned by tests so the
  * [abort] / [abort cleanup] semantics cannot accidentally flip back to
- * the buggy alias-to-cleanup behavior.
+ * the buggy alias-to-cleanup behavior, and so [codex-review] always
+ * routes to the queue-write handler.
  *
- *   [abort]         => abort-create   (touch the flag)
- *   [abort cleanup] => abort-cleanup  (rm -f the flag)
- *   [abort-test]    => abort-test     (touch + verify + rm cycle)
+ *   [abort]         => abort-create        (touch the flag)
+ *   [abort cleanup] => abort-cleanup       (rm -f the flag)
+ *   [abort-test]    => abort-test          (touch + verify + rm cycle)
+ *   [codex-review]  => codex-review-queue  (queue file write)
  */
 export function routeTrigger(trigger: Trigger): TriggerAction {
   switch (trigger) {
@@ -150,6 +190,8 @@ export function routeTrigger(trigger: Trigger): TriggerAction {
       return 'abort-create'
     case '[abort cleanup]':
       return 'abort-cleanup'
+    case '[codex-review]':
+      return 'codex-review-queue'
     case 'status?':
       return 'status'
     case 'prs?':
@@ -181,19 +223,431 @@ export function clampPollInterval(raw: number | undefined): number {
   return raw
 }
 
+// --- token detect (Phase 1: reject-only, no masking) ------------------
+
+/**
+ * Token-like patterns the watcher refuses to enqueue. Phase 1 is
+ * reject-only by design (= avoid storing or echoing secrets). Masking
+ * is deferred to Phase 2.
+ *
+ * Length thresholds are heuristics to avoid false positives on common
+ * short words (e.g. "Bearer in mind").
+ */
+const TOKEN_PATTERNS: { name: string; pattern: RegExp }[] = [
+  { name: 'xoxb', pattern: /\bxoxb-[A-Za-z0-9-]{20,}/ },
+  { name: 'xapp', pattern: /\bxapp-[A-Za-z0-9-]{20,}/ },
+  { name: 'sk', pattern: /\bsk-[A-Za-z0-9_-]{20,}/i },
+  { name: 'bearer', pattern: /\bBearer\s+[A-Za-z0-9._~+/-]{16,}/i },
+  { name: 'ghp', pattern: /\bghp_[A-Za-z0-9]{20,}/ },
+  { name: 'ghs', pattern: /\bghs_[A-Za-z0-9]{20,}/ },
+]
+
+/**
+ * Detect a token-like raw secret in the input. Returns the matched
+ * pattern name (e.g. "xoxb", "bearer") or null. The watcher rejects
+ * any input that matches and replies with format error.
+ */
+export function detectToken(text: string): string | null {
+  for (const { name, pattern } of TOKEN_PATTERNS) {
+    if (pattern.test(text)) return name
+  }
+  return null
+}
+
+// --- [codex-review] parser (exported for testing) ---------------------
+
+export type CodexReviewParsed =
+  | {
+      form: 'pr-url'
+      repo: string
+      pr_number: number
+      summary: string
+      role?: string
+    }
+  | {
+      form: 'issue-url'
+      repo: string
+      issue_url: string
+      issue_number: number
+      summary: string
+      role?: string
+    }
+  | {
+      form: 'repo-pr'
+      repo: string
+      pr_number: number
+      summary: string
+      role?: string
+    }
+
+export type CodexReviewError = { error: string }
+
+/**
+ * Parse the body of a `[codex-review]` Slack DM. Returns either a
+ * structured result (one of three forms) or an error. The caller is
+ * responsible for token detection and queue interaction.
+ *
+ * Forms (case-insensitive prefix and keys; values keep case):
+ *   [codex-review] pr=<github-pr-url> summary=<text>
+ *   [codex-review] issue=<github-issue-url> summary=<text>
+ *   [codex-review] repo=<owner/repo> pr=<number> summary=<text>
+ *
+ * Rules:
+ *   - Exactly one space between the prefix and the args.
+ *   - `summary=` is always last; everything to end of line is the
+ *     summary text (free-form, may contain spaces).
+ *   - The three forms are exclusive (e.g. `pr=` and `issue=` together
+ *     is invalid).
+ *   - Optional `role=hikaru|consultant|executor|agent` (case-
+ *     insensitive value). Invalid role -> error. Default sender_role
+ *     resolution lives in the handler (hikaru if sender is the
+ *     configured hikaruUserId, agent otherwise).
+ *   - Unknown keys are an error.
+ */
+export function parseCodexReview(text: string): CodexReviewParsed | CodexReviewError {
+  const trimmed = text.trim()
+  // Case-insensitive prefix detection but keep original casing for
+  // value extraction.
+  const lowered = trimmed.toLowerCase()
+  const prefix = '[codex-review] '
+  if (!lowered.startsWith(prefix)) {
+    return { error: 'missing [codex-review] prefix or no space after it' }
+  }
+  const args = trimmed.slice(prefix.length)
+
+  // Locate `summary=` (case-insensitive) — it splits head args from
+  // free-text body.
+  const loweredArgs = args.toLowerCase()
+  const summaryIdx = loweredArgs.indexOf('summary=')
+  if (summaryIdx < 0) {
+    return { error: 'missing summary= field' }
+  }
+  const headPart = args.slice(0, summaryIdx).trim()
+  const summary = args.slice(summaryIdx + 'summary='.length).trim()
+  if (!summary) {
+    return { error: 'empty summary= value' }
+  }
+
+  // Parse head part as space-separated key=value pairs (URLs and
+  // owner/repo do not contain spaces, so simple split is safe).
+  const kvs: Record<string, string> = {}
+  for (const tok of headPart.split(/\s+/).filter((s) => s.length > 0)) {
+    const eq = tok.indexOf('=')
+    if (eq < 0) {
+      return { error: `unknown token (no =): ${tok}` }
+    }
+    const k = tok.slice(0, eq).toLowerCase()
+    const v = tok.slice(eq + 1)
+    if (Object.hasOwn(kvs, k)) {
+      return { error: `duplicate key: ${k}` }
+    }
+    kvs[k] = v
+  }
+
+  // Validate keys.
+  const allowedKeys = new Set(['pr', 'issue', 'repo', 'role'])
+  for (const k of Object.keys(kvs)) {
+    if (!allowedKeys.has(k)) {
+      return { error: `unknown key: ${k}` }
+    }
+  }
+
+  // Optional `role=` validation. Lowercase the value so the canonical
+  // form goes into the parsed result and downstream frontmatter.
+  let role: string | undefined
+  if ('role' in kvs) {
+    const r = kvs.role.toLowerCase()
+    if (!ALLOWED_ROLES.has(r)) {
+      return {
+        error: `invalid role=${kvs.role} (allowed: ${[...ALLOWED_ROLES].join(', ')})`,
+      }
+    }
+    role = r
+  }
+
+  const hasPr = 'pr' in kvs
+  const hasIssue = 'issue' in kvs
+  const hasRepo = 'repo' in kvs
+
+  // Exclusivity: issue= cannot combine with pr= or repo=.
+  if (hasIssue && (hasPr || hasRepo)) {
+    return { error: 'issue= cannot be combined with pr= or repo=' }
+  }
+
+  // Form B: issue=<github-issue-url> alone.
+  if (hasIssue) {
+    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)(?:[?#].*)?$/.exec(kvs.issue)
+    if (!m) {
+      return {
+        error: 'issue= must be a GitHub issue URL (https://github.com/<owner>/<repo>/issues/<n>)',
+      }
+    }
+    return {
+      form: 'issue-url',
+      repo: `${m[1]}/${m[2]}`,
+      issue_url: kvs.issue,
+      issue_number: Number.parseInt(m[3], 10),
+      summary,
+      role,
+    }
+  }
+
+  // Form C: repo=<owner/repo> + pr=<number>.
+  if (hasRepo) {
+    if (!hasPr) {
+      return { error: 'repo= requires pr=<number>' }
+    }
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(kvs.repo)) {
+      return { error: 'repo= must be <owner>/<name>' }
+    }
+    if (!/^\d+$/.test(kvs.pr)) {
+      return { error: 'with repo=, pr= must be numeric' }
+    }
+    return {
+      form: 'repo-pr',
+      repo: kvs.repo,
+      pr_number: Number.parseInt(kvs.pr, 10),
+      summary,
+      role,
+    }
+  }
+
+  // Form A: pr=<github-pr-url> alone.
+  if (hasPr) {
+    const m = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)(?:[?#].*)?$/.exec(kvs.pr)
+    if (!m) {
+      return {
+        error:
+          'pr= must be a GitHub PR URL (https://github.com/<owner>/<repo>/pull/<n>) or paired with repo=<owner/repo>',
+      }
+    }
+    return {
+      form: 'pr-url',
+      repo: `${m[1]}/${m[2]}`,
+      pr_number: Number.parseInt(m[3], 10),
+      summary,
+      role,
+    }
+  }
+
+  return { error: 'no pr= / issue= / repo= field provided' }
+}
+
+/**
+ * Compute the dedup key for a parsed codex-review entry.
+ * Same key => same logical PR/Issue.
+ *
+ *   pr forms (Form A or C) => "<repo>#pr-<n>"
+ *   issue form (Form B)    => "<repo>#issue-<n>"
+ */
+export function computeQueueKey(parsed: CodexReviewParsed): string {
+  if (parsed.form === 'issue-url') {
+    return `${parsed.repo}#issue-${parsed.issue_number}`
+  }
+  return `${parsed.repo}#pr-${parsed.pr_number}`
+}
+
+/**
+ * Build the queue filename. ISO timestamp has its `:` and `.` replaced
+ * by `-` so the filename is valid on Windows (no `:` `*` `?` `<` `>`
+ * `|` `"`). Repo's `/` becomes `_` so the filename has no path
+ * separator.
+ */
+export function queueFilenameFor(createdAt: Date, parsed: CodexReviewParsed): string {
+  const iso = createdAt.toISOString().replace(/[:.]/g, '-')
+  const repoSafe = parsed.repo.replace(/\//g, '_')
+  const idPart =
+    parsed.form === 'issue-url'
+      ? `${repoSafe}-issue${parsed.issue_number}`
+      : `${repoSafe}-pr${parsed.pr_number}`
+  return `${iso}-${idPart}.md`
+}
+
+// --- frontmatter (exported for testing) -------------------------------
+
+export type FrontmatterValue = string | number | null
+export type Frontmatter = Record<string, FrontmatterValue>
+
+/**
+ * Serialize a flat key/value map to YAML-ish frontmatter (one line per
+ * key, double-quoted strings with backslash escapes for `\`, `"`,
+ * `\n`, `\r`). Numbers and `null` are emitted bare.
+ *
+ * Intentionally minimal — the watcher controls both ends, so we don't
+ * pull a YAML lib for nested structures we don't use.
+ */
+
+/**
+ * Escape a string for the double-quoted YAML scalar form we emit.
+ * Order matters: backslash MUST be escaped first so the backslash
+ * introduced by subsequent escapes (`\"`, `\n`, `\r`) is not
+ * re-escaped.
+ */
+export function escapeYamlString(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
+}
+
+/**
+ * Inverse of escapeYamlString. Single-pass to avoid the order trap of
+ * a multi-replace pipeline (the prior multi-replace would corrupt a
+ * literal `\n` (= backslash + n in the source string) by treating it
+ * as an escape after the leading backslash had already been doubled).
+ *
+ * Recognized escapes: `\\\\` -> `\`, `\\"` -> `"`, `\\n` -> newline,
+ * `\\r` -> CR. Unknown escapes (`\\x`) are passed through verbatim
+ * (= `\\x` stays `\\x` in the decoded string), so an unrecognized
+ * escape never silently loses the leading backslash.
+ */
+export function unescapeYamlString(s: string): string {
+  let out = ''
+  let i = 0
+  while (i < s.length) {
+    if (s[i] === '\\' && i + 1 < s.length) {
+      const next = s[i + 1]
+      if (next === '\\') out += '\\'
+      else if (next === '"') out += '"'
+      else if (next === 'n') out += '\n'
+      else if (next === 'r') out += '\r'
+      else out += `\\${next}` // unknown escape: keep verbatim (no silent drop)
+      i += 2
+    } else {
+      out += s[i]
+      i++
+    }
+  }
+  return out
+}
+
+export function serializeFrontmatter(fm: Frontmatter): string {
+  const lines: string[] = []
+  for (const [k, v] of Object.entries(fm)) {
+    if (v === null) {
+      lines.push(`${k}: null`)
+    } else if (typeof v === 'number') {
+      lines.push(`${k}: ${v}`)
+    } else {
+      lines.push(`${k}: "${escapeYamlString(v)}"`)
+    }
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Parse a `---\n<frontmatter>\n---\n<body>` file. Mirrors the shape
+ * serializeFrontmatter() emits. Unknown YAML constructs (lists, nested
+ * maps) are not supported by design.
+ */
+export function parseFrontmatterFile(content: string): { fm: Frontmatter; body: string } | null {
+  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(content)
+  if (!m) return null
+  const fm: Frontmatter = {}
+  for (const line of m[1].split('\n')) {
+    const lineMatch = /^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/.exec(line)
+    if (!lineMatch) continue
+    const k = lineMatch[1]
+    const raw = lineMatch[2].trim()
+    if (raw === 'null') {
+      fm[k] = null
+    } else if (/^-?\d+$/.test(raw)) {
+      fm[k] = Number.parseInt(raw, 10)
+    } else if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
+      fm[k] = unescapeYamlString(raw.slice(1, -1))
+    } else {
+      fm[k] = raw
+    }
+  }
+  return { fm, body: m[2] ?? '' }
+}
+
+// --- queue file ops (exported for testing, take queueDir param) -------
+
+export interface QueueEntry {
+  path: string
+  fm: Frontmatter
+  body: string
+}
+
+/**
+ * List all parseable .md entries under queueDir. Returns an empty
+ * array if the dir does not exist (= "no queue yet" = 0 entries).
+ */
+export function listQueueEntries(queueDir: string): QueueEntry[] {
+  if (!existsSync(queueDir)) return []
+  const out: QueueEntry[] = []
+  for (const name of readdirSync(queueDir)) {
+    if (!name.endsWith('.md')) continue
+    const path = join(queueDir, name)
+    let content: string
+    try {
+      content = readFileSync(path, 'utf-8')
+    } catch {
+      continue
+    }
+    const parsed = parseFrontmatterFile(content)
+    if (parsed) out.push({ path, fm: parsed.fm, body: parsed.body })
+  }
+  return out
+}
+
+/**
+ * Recover the dedup key from a stored frontmatter. Returns null if the
+ * frontmatter does not have enough info to compute a key.
+ */
+export function entryKey(fm: Frontmatter): string | null {
+  const repo = fm.repo
+  if (typeof repo !== 'string') return null
+  if (typeof fm.pr_number === 'number') return `${repo}#pr-${fm.pr_number}`
+  if (typeof fm.issue_url === 'string') {
+    const m = /\/issues\/(\d+)(?:[?#].*)?$/.exec(fm.issue_url)
+    if (m) return `${repo}#issue-${m[1]}`
+  }
+  return null
+}
+
+/**
+ * Find an entry with the given dedup key. Returns null if no match.
+ */
+export function findEntryByKey(queueDir: string, key: string): QueueEntry | null {
+  for (const e of listQueueEntries(queueDir)) {
+    if (entryKey(e.fm) === key) return e
+  }
+  return null
+}
+
+/**
+ * Count entries whose status is `pending` or `blocked`. Reviewed
+ * entries are excluded from the queue size cap.
+ */
+export function countActiveEntries(entries: QueueEntry[]): number {
+  let n = 0
+  for (const e of entries) {
+    const s = e.fm.status
+    if (s === 'pending' || s === 'blocked') n++
+  }
+  return n
+}
+
 // --- config -----------------------------------------------------------
 
 interface Config {
   hikaruUserId: string
   hikaruDmChannel: string
   pollIntervalMs?: number
+  /**
+   * Per-trigger allowlist for [codex-review] sender. Defaults to
+   * [hikaruUserId]. Add Claude Bridge bot user_id, consultant /
+   * executor session user_ids here so completion reports can post
+   * directly to the queue without going through Hikaru's account.
+   * The other 5 prefixes remain Hikaru-only regardless of this list.
+   */
+  codexReviewSenderUserIds?: string[]
 }
 
 function loadConfig(): Config {
   if (!existsSync(CONFIG_FILE)) {
     console.error(`[watcher] missing config: ${CONFIG_FILE}`)
     console.error(
-      '[watcher] expected JSON: { "hikaruUserId": "U...", "hikaruDmChannel": "D...", "pollIntervalMs": 5000 }',
+      '[watcher] expected JSON: { "hikaruUserId": "U...", "hikaruDmChannel": "D...", "pollIntervalMs": 5000, "codexReviewSenderUserIds": ["U..."] }',
     )
     process.exit(1)
   }
@@ -204,7 +658,39 @@ function loadConfig(): Config {
   if (!/^D[A-Z0-9]+$/.test(raw.hikaruDmChannel)) {
     throw new Error(`Invalid hikaruDmChannel in config: ${raw.hikaruDmChannel}`)
   }
+  if (raw.codexReviewSenderUserIds !== undefined) {
+    if (!Array.isArray(raw.codexReviewSenderUserIds)) {
+      throw new Error('codexReviewSenderUserIds must be a string array')
+    }
+    for (const u of raw.codexReviewSenderUserIds) {
+      if (typeof u !== 'string' || !/^U[A-Z0-9]+$/.test(u)) {
+        throw new Error(`Invalid user id in codexReviewSenderUserIds: ${u}`)
+      }
+    }
+  }
   return raw
+}
+
+/**
+ * Per-trigger sender gate. Only `[codex-review]` consults the
+ * `codexReviewAllowlist`; every other trigger is Hikaru-only.
+ *
+ * The allowlist for `[codex-review]` is the resolved list (= the
+ * caller is expected to fall the config's optional list back to
+ * `[hikaruUserId]`). Returns false for any non-string userId so the
+ * gate is closed by default for malformed Slack payloads.
+ */
+export function isAllowedSender(
+  userId: string | undefined,
+  trigger: Trigger,
+  hikaruUserId: string,
+  codexReviewAllowlist: readonly string[],
+): boolean {
+  if (typeof userId !== 'string' || userId.length === 0) return false
+  if (trigger === '[codex-review]') {
+    return codexReviewAllowlist.includes(userId)
+  }
+  return userId === hikaruUserId
 }
 
 function loadBotToken(): string {
@@ -228,9 +714,7 @@ interface PrSummary {
   url: string
 }
 
-type PrListResult =
-  | { ok: true; prs: PrSummary[] }
-  | { ok: false; error: string }
+type PrListResult = { ok: true; prs: PrSummary[] } | { ok: false; error: string }
 
 function listOpenPrs(repo: string): PrListResult {
   try {
@@ -274,9 +758,7 @@ function acquireLock(): void {
         )
         process.exit(1)
       } catch {
-        console.warn(
-          `[watcher] stale pid file (pid ${oldPid} not running); cleaning up.`,
-        )
+        console.warn(`[watcher] stale pid file (pid ${oldPid} not running); cleaning up.`)
       }
     }
   }
@@ -292,17 +774,30 @@ function acquireLock(): void {
 
 // --- main loop --------------------------------------------------------
 
+interface SlackMessage {
+  user?: string
+  text?: string
+  ts?: string
+  thread_ts?: string
+}
+
+const FORMAT_HINT =
+  'Expected: `[codex-review] pr=<github-pr-url> summary=<text>` or `issue=<url>` or `repo=<owner/repo> pr=<n>`'
+
 async function main(): Promise<void> {
   acquireLock()
   const config = loadConfig()
   const slack = new WebClient(loadBotToken())
   const pollIntervalMs = clampPollInterval(config.pollIntervalMs)
+  // Resolve the [codex-review] sender allowlist once at startup. Other
+  // triggers ignore this list and stay Hikaru-only via isAllowedSender.
+  const codexReviewAllowlist = config.codexReviewSenderUserIds ?? [config.hikaruUserId]
 
   let lastTs = existsSync(LAST_TS_FILE)
     ? readFileSync(LAST_TS_FILE, 'utf-8').trim()
     : String(Math.floor(Date.now() / 1000))
   console.log(
-    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} pollMs=${pollIntervalMs} lastTs=${lastTs}`,
+    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs}`,
   )
 
   async function reply(text: string, threadTs: string): Promise<void> {
@@ -325,18 +820,12 @@ async function main(): Promise<void> {
     }
     execFileSync('touch', [ABORT_FLAG])
     if (!existsSync(ABORT_FLAG)) {
-      await reply(
-        'abort-test: touch did not create the flag (unexpected).',
-        threadTs,
-      )
+      await reply('abort-test: touch did not create the flag (unexpected).', threadTs)
       return
     }
     execFileSync('rm', ['-f', ABORT_FLAG])
     if (existsSync(ABORT_FLAG)) {
-      await reply(
-        'abort-test: rm did not remove the flag (unexpected).',
-        threadTs,
-      )
+      await reply('abort-test: rm did not remove the flag (unexpected).', threadTs)
       return
     }
     await reply('abort-test 完了、cleanup OK', threadTs)
@@ -344,10 +833,7 @@ async function main(): Promise<void> {
 
   async function handleAbortCreate(threadTs: string): Promise<void> {
     if (existsSync(ABORT_FLAG)) {
-      await reply(
-        `abort: flag already present at ${ABORT_FLAG}, no-op.`,
-        threadTs,
-      )
+      await reply(`abort: flag already present at ${ABORT_FLAG}, no-op.`, threadTs)
       return
     }
     execFileSync('touch', [ABORT_FLAG])
@@ -360,18 +846,12 @@ async function main(): Promise<void> {
 
   async function handleAbortCleanup(threadTs: string): Promise<void> {
     if (!existsSync(ABORT_FLAG)) {
-      await reply(
-        `abort cleanup: no flag at ${ABORT_FLAG}, nothing to do.`,
-        threadTs,
-      )
+      await reply(`abort cleanup: no flag at ${ABORT_FLAG}, nothing to do.`, threadTs)
       return
     }
     execFileSync('rm', ['-f', ABORT_FLAG])
     if (existsSync(ABORT_FLAG)) {
-      await reply(
-        'abort cleanup: rm did not remove the flag (unexpected).',
-        threadTs,
-      )
+      await reply('abort cleanup: rm did not remove the flag (unexpected).', threadTs)
       return
     }
     await reply('abort cleanup OK', threadTs)
@@ -422,8 +902,7 @@ async function main(): Promise<void> {
     }
     const shown = all.slice(0, PR_LIMIT)
     const lines = shown.map(
-      (p) =>
-        `  [${p.repo.replace('4466hikaru/', '')}] #${p.number} ${p.title} — ${p.url}`,
+      (p) => `  [${p.repo.replace('4466hikaru/', '')}] #${p.number} ${p.title} — ${p.url}`,
     )
     if (all.length > PR_LIMIT) {
       lines.push(`  (+${all.length - PR_LIMIT} more)`)
@@ -431,13 +910,127 @@ async function main(): Promise<void> {
     if (errorRepo) {
       lines.push(`  warning: gh error on ${errorRepo}: ${errorMsg}`)
     }
-    await reply(
-      `prs (open, max ${PR_LIMIT} across 3 repos):\n${lines.join('\n')}`,
-      threadTs,
-    )
+    await reply(`prs (open, max ${PR_LIMIT} across 3 repos):\n${lines.join('\n')}`, threadTs)
   }
 
-  async function dispatch(trigger: Trigger, threadTs: string): Promise<void> {
+  async function handleCodexReview(msg: SlackMessage, threadTs: string): Promise<void> {
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const ts = typeof msg.ts === 'string' ? msg.ts : ''
+    const userId = typeof msg.user === 'string' ? msg.user : ''
+
+    // 1. Token detect first — short-circuit before any parsing or
+    // filesystem touch so secrets never get written or echoed.
+    const tokenName = detectToken(text)
+    if (tokenName) {
+      await reply(
+        `format error: token-like raw secret detected (pattern=${tokenName}); strip secrets and retry. ${FORMAT_HINT}`,
+        threadTs,
+      )
+      return
+    }
+
+    // 2. Parse.
+    const parsed = parseCodexReview(text)
+    if ('error' in parsed) {
+      await reply(`format error: ${parsed.error}. ${FORMAT_HINT}`, threadTs)
+      return
+    }
+
+    const key = computeQueueKey(parsed)
+
+    // Ensure queue dir exists (created on first write only).
+    try {
+      mkdirSync(CODEX_REVIEW_QUEUE_DIR, { recursive: true })
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      await reply(`[codex-review] failed to ensure queue dir: ${m}`, threadTs)
+      return
+    }
+
+    // 3. Idempotent update path.
+    const existing = findEntryByKey(CODEX_REVIEW_QUEUE_DIR, key)
+    if (existing) {
+      const existingSenderId = existing.fm.sender_id
+      const allowed =
+        (typeof existingSenderId === 'string' && existingSenderId === userId) ||
+        userId === config.hikaruUserId
+      if (!allowed) {
+        await reply(
+          `format error: only the original sender or Hikaru can update an existing queue entry`,
+          threadTs,
+        )
+        return
+      }
+      const updated: Frontmatter = { ...existing.fm }
+      updated.summary = parsed.summary
+      updated.message_ts = ts
+      updated.status = 'pending'
+      // role= on update is honored as an explicit re-classification.
+      // Without it the existing sender_role is preserved.
+      if (parsed.role) {
+        updated.sender_role = parsed.role
+      }
+      const newContent = `---\n${serializeFrontmatter(updated)}\n---\n${existing.body || ''}`
+      writeFileSync(existing.path, newContent)
+      const entries = listQueueEntries(CODEX_REVIEW_QUEUE_DIR)
+      const active = countActiveEntries(entries)
+      let line = `Codex review queue 更新済み (key=${key}, queue size: ${active})`
+      if (active > WARN_QUEUE_PENDING) {
+        line += ` ⚠️ size > ${WARN_QUEUE_PENDING}`
+      }
+      await reply(line, threadTs)
+      return
+    }
+
+    // 4. New entry: enforce size cap.
+    const beforeEntries = listQueueEntries(CODEX_REVIEW_QUEUE_DIR)
+    const beforeActive = countActiveEntries(beforeEntries)
+    if (beforeActive >= MAX_QUEUE_PENDING) {
+      await reply(
+        `format error: queue is full (${beforeActive} >= ${MAX_QUEUE_PENDING}); resolve some entries before adding more`,
+        threadTs,
+      )
+      return
+    }
+
+    // 5. Write the new entry. Sender role precedence: explicit
+    //    role= argument wins; otherwise derive from the sender
+    //    (hikaruUserId -> "hikaru", any other allowlisted sender ->
+    //    "agent"). All values come from the ALLOWED_ROLES set so the
+    //    field is bounded.
+    const createdAt = new Date()
+    const senderRole = parsed.role ?? (userId === config.hikaruUserId ? 'hikaru' : 'agent')
+    const fm: Frontmatter = {
+      created_at: createdAt.toISOString(),
+      source: 'slack',
+      repo: parsed.repo,
+      sender_role: senderRole,
+      sender_id: userId,
+      chat_id: config.hikaruDmChannel,
+      message_ts: ts,
+      summary: parsed.summary,
+      status: 'pending',
+      priority: 'P3',
+    }
+    if (parsed.form === 'issue-url') {
+      fm.issue_url = parsed.issue_url
+    } else {
+      fm.pr_number = parsed.pr_number
+    }
+    const filename = queueFilenameFor(createdAt, parsed)
+    const path = join(CODEX_REVIEW_QUEUE_DIR, filename)
+    const content = `---\n${serializeFrontmatter(fm)}\n---\n`
+    writeFileSync(path, content)
+
+    const newActive = beforeActive + 1
+    let line = `Codex review queue に登録済み (key=${key}, queue size: ${newActive})`
+    if (newActive > WARN_QUEUE_PENDING) {
+      line += ` ⚠️ size > ${WARN_QUEUE_PENDING}`
+    }
+    await reply(line, threadTs)
+  }
+
+  async function dispatch(trigger: Trigger, msg: SlackMessage, threadTs: string): Promise<void> {
     switch (routeTrigger(trigger)) {
       case 'abort-test':
         await handleAbortTest(threadTs)
@@ -447,6 +1040,9 @@ async function main(): Promise<void> {
         break
       case 'abort-cleanup':
         await handleAbortCleanup(threadTs)
+        break
+      case 'codex-review-queue':
+        await handleCodexReview(msg, threadTs)
         break
       case 'status':
         await handleStatus(threadTs)
@@ -467,24 +1063,30 @@ async function main(): Promise<void> {
     // conversations.history returns newest-first; flip to chronological.
     const messages = (result.messages ?? []).slice().reverse()
     for (const msg of messages) {
-      if (msg.user !== config.hikaruUserId) continue
       if (typeof msg.text !== 'string' || typeof msg.ts !== 'string') continue
       const trig = detectTrigger(msg.text)
       if (!trig) continue
+      // Per-trigger sender gate. [codex-review] uses the resolved
+      // codexReviewAllowlist; everything else stays Hikaru-only.
+      if (
+        !isAllowedSender(
+          msg.user as string | undefined,
+          trig,
+          config.hikaruUserId,
+          codexReviewAllowlist,
+        )
+      ) {
+        continue
+      }
       const threadTs = (msg.thread_ts as string | undefined) ?? msg.ts
-      console.log(
-        `[watcher] trigger=${trig} ts=${msg.ts} thread=${threadTs}`,
-      )
+      console.log(`[watcher] trigger=${trig} ts=${msg.ts} sender=${msg.user} thread=${threadTs}`)
       try {
-        await dispatch(trig, threadTs)
+        await dispatch(trig, msg as SlackMessage, threadTs)
       } catch (e) {
         const errMsg = e instanceof Error ? e.message : String(e)
         console.error(`[watcher] handler ${trig} failed:`, errMsg)
         try {
-          await reply(
-            `[watcher] handler error for ${trig}: ${errMsg}`,
-            threadTs,
-          )
+          await reply(`[watcher] handler error for ${trig}: ${errMsg}`, threadTs)
         } catch {
           // best effort
         }
@@ -511,9 +1113,7 @@ async function main(): Promise<void> {
     try {
       await poll()
     } catch (e) {
-      console.error(
-        `[watcher] poll error: ${e instanceof Error ? e.message : String(e)}`,
-      )
+      console.error(`[watcher] poll error: ${e instanceof Error ? e.message : String(e)}`)
     }
     if (stop) break
     await new Promise((r) => setTimeout(r, pollIntervalMs))
