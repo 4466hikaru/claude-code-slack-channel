@@ -122,6 +122,11 @@ writes a YAML frontmatter file to the **absolute** queue directory
   value). Invalid role -> format error. If omitted, the handler
   derives the role from the sender: `hikaru` when sender ==
   `hikaruUserId`, `agent` otherwise.
+- Slack mrkdwn auto-link wraps URLs as `<url>` (and optionally
+  `<url|display>`) when fetched via `conversations.history`. The
+  parser strips the wrapper before applying the URL regex, so both
+  raw and wrapped forms work. Whitespace inside `<...>` is also
+  preserved during tokenization (display text may contain spaces).
 - Unknown keys are rejected with format error.
 
 ### Frontmatter (8 required fields + Slack metadata)
