@@ -40,11 +40,29 @@
  *                      cap pending+blocked at 50, warn above 20.
  *                      Phase 1 = queue WRITE only. Codex automation /
  *                      review / merge are out of scope for this Phase.
+ *   ok              -> approved Codex outbox dispatch (bd ccsc-81q
+ *                      Phase 1): bare `OK` approves the unique pending
+ *                      draft IFF (1) exactly 1 pending, (2) within TTL,
+ *                      (3) Slack thread matches. Otherwise replies
+ *                      with the candidate list and asks for explicit
+ *                      `approve <draft-id>`.
+ *   approve <id>    -> explicit approve of a specific draft. Always
+ *                      accepted, ambiguity-free; idempotent.
+ *   cancel <id>     -> cancel a pending draft, or an approved draft
+ *                      still inside the 5s grace window. After grace
+ *                      / sent: reply "too late".
+ *   pending?        -> list up to 5 pending drafts (oldest first)
+ *                      with their summary first lines.
  *   status?         -> watcher alive / abort-flag presence / open PR
  *                      count across the 3 active repos / blocker
  *                      (`unknown` until a detection mechanism exists)
  *   prs?            -> top open PRs across the 3 active repos
  *                      (max 5 total)
+ *
+ * On every main-loop tick the watcher also runs a dispatch sweep
+ * (`dispatchSweep`): pending entries past TTL auto-cancel; approved
+ * entries past the 5s grace window dispatch over Slack Web API to
+ * their `slack_chat_id` (held while the abort flag is present).
  *
  * Handler routing is pinned by routeTrigger() + the test file so that
  * the [abort] / [abort cleanup] semantics cannot accidentally flip.
@@ -86,6 +104,24 @@ import {
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { WebClient } from '@slack/web-api'
+import {
+  APPROVE_GRACE_MS,
+  extractDraftIdArg,
+  filterApproved,
+  filterPending,
+  findDuplicateDraftIds,
+  findEntriesByDraftId,
+  findEntryByDraftId,
+  isWithinGrace,
+  isWithinTtl,
+  listOutboxEntries,
+  OUTBOX_DIR,
+  type OutboxEntry,
+  resolveBareOk,
+  shouldDispatch,
+  summaryLine,
+  transitionEntry,
+} from './outbox'
 
 // --- constants --------------------------------------------------------
 
@@ -138,6 +174,10 @@ export const TRIGGERS = [
   '[abort cleanup]',
   '[abort]',
   '[codex-review]',
+  'approve',
+  'cancel',
+  'ok',
+  'pending?',
   'status?',
   'prs?',
 ] as const
@@ -148,6 +188,10 @@ export type TriggerAction =
   | 'abort-create'
   | 'abort-cleanup'
   | 'codex-review-queue'
+  | 'dispatch-ok'
+  | 'dispatch-approve'
+  | 'dispatch-cancel'
+  | 'dispatch-pending'
   | 'status'
   | 'prs'
 
@@ -166,7 +210,17 @@ export type TriggerAction =
 export function detectTrigger(text: string): Trigger | null {
   const t = text.trim().toLowerCase()
   for (const trig of TRIGGERS) {
-    if (t.startsWith(trig)) return trig
+    if (!t.startsWith(trig)) continue
+    // For triggers ending in a letter (= bare-word commands like `ok`,
+    // `approve`, `cancel`), require a word boundary so "okay" or
+    // "approver" do not accidentally trigger. Bracketed and `?`-suffixed
+    // triggers are self-terminating and skip this check.
+    const lastCh = trig[trig.length - 1]
+    if (/[a-z]/i.test(lastCh)) {
+      const nextCh = t[trig.length]
+      if (nextCh !== undefined && /[a-z0-9_-]/i.test(nextCh)) continue
+    }
+    return trig
   }
   return null
 }
@@ -192,6 +246,14 @@ export function routeTrigger(trigger: Trigger): TriggerAction {
       return 'abort-cleanup'
     case '[codex-review]':
       return 'codex-review-queue'
+    case 'ok':
+      return 'dispatch-ok'
+    case 'approve':
+      return 'dispatch-approve'
+    case 'cancel':
+      return 'dispatch-cancel'
+    case 'pending?':
+      return 'dispatch-pending'
     case 'status?':
       return 'status'
     case 'prs?':
@@ -1095,6 +1157,280 @@ async function main(): Promise<void> {
     await reply(line, threadTs)
   }
 
+  // --- approved Codex outbox dispatch (bd ccsc-81q Phase 1) ---------
+
+  // Render a candidate / pending line. Includes the Slack target so
+  // Hikaru can see WHERE a dispatch will go BEFORE typing OK / approve
+  // (per Codex review on PR #5: target visibility before approval).
+  function renderEntryLine(entry: OutboxEntry): string {
+    const sum = summaryLine(entry) || '(no summary)'
+    const target = entry.slack_chat_id ?? '(no chat_id)'
+    return `  ${entry.draft_id}: ${sum} -> ${target}`
+  }
+
+  async function handleOk(msg: SlackMessage, threadTs: string): Promise<void> {
+    const now = Date.now()
+    const userId = typeof msg.user === 'string' ? msg.user : 'hikaru'
+    const entries = listOutboxEntries(OUTBOX_DIR)
+    const dups = findDuplicateDraftIds(entries)
+    if (dups.length > 0) {
+      console.warn(`[watcher] outbox duplicate draft_id: ${dups.join(', ')}`)
+    }
+    const messageThreadTs = (msg.thread_ts as string | undefined) ?? msg.ts
+    const result = resolveBareOk(entries, now, messageThreadTs)
+    if (!result.ok) {
+      if (result.reason === 'no-pending') {
+        await reply('OK: no pending drafts.', threadTs)
+        return
+      }
+      const candLines = result.candidates.map((c) => renderEntryLine(c))
+      await reply(
+        `OK ambiguous (${result.reason}): use \`approve <draft-id>\` from below:\n${candLines.join('\n')}`,
+        threadTs,
+      )
+      return
+    }
+    // Refuse to approve when the same draft_id appears in multiple
+    // files (= Codex side bug indicator). Per Codex review, both
+    // duplicates stay untouched and Hikaru is asked to resolve.
+    if (findEntriesByDraftId(entries, result.entry.draft_id).length > 1) {
+      await reply(
+        `OK refused: draft_id ${result.entry.draft_id} has duplicate files in the outbox; manual cleanup required (no transition).`,
+        threadTs,
+      )
+      return
+    }
+    transitionEntry(result.entry, {
+      status: 'approved',
+      approved_at: new Date(now).toISOString(),
+      approved_by: userId,
+    })
+    const target = result.entry.slack_chat_id ?? '(no chat_id)'
+    await reply(
+      `approved ${result.entry.draft_id} -> ${target}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`,
+      threadTs,
+    )
+  }
+
+  async function handleApprove(msg: SlackMessage, threadTs: string): Promise<void> {
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const draftId = extractDraftIdArg(text, 'approve')
+    if (!draftId) {
+      await reply('format error: expected `approve <draft-id>`', threadTs)
+      return
+    }
+    const userId = typeof msg.user === 'string' ? msg.user : 'hikaru'
+    const now = Date.now()
+    const entries = listOutboxEntries(OUTBOX_DIR)
+    const target = findEntryByDraftId(entries, draftId)
+    if (!target) {
+      await reply(`approve: draft_id ${draftId} not found in outbox`, threadTs)
+      return
+    }
+    // Duplicate gate (Codex review on PR #5).
+    if (findEntriesByDraftId(entries, draftId).length > 1) {
+      await reply(
+        `approve refused: draft_id ${draftId} has duplicate files in the outbox; manual cleanup required (no transition).`,
+        threadTs,
+      )
+      return
+    }
+    switch (target.status) {
+      case 'pending': {
+        // TTL gate (Codex review on PR #5: bare-OK already checks
+        // TTL via resolveBareOk; explicit approve must too).
+        if (!isWithinTtl(target, now)) {
+          transitionEntry(target, {
+            status: 'cancelled',
+            cancelled_at: new Date(now).toISOString(),
+            failure_reason: 'ttl-expired',
+          })
+          await reply(
+            `approve: ${draftId} ttl expired -> transitioned to cancelled (no dispatch)`,
+            threadTs,
+          )
+          return
+        }
+        transitionEntry(target, {
+          status: 'approved',
+          approved_at: new Date(now).toISOString(),
+          approved_by: userId,
+        })
+        const dispatchTarget = target.slack_chat_id ?? '(no chat_id)'
+        await reply(
+          `approved ${draftId} -> ${dispatchTarget}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`,
+          threadTs,
+        )
+        return
+      }
+      case 'approved':
+        await reply(`approve: ${draftId} is already approved (idempotent no-op)`, threadTs)
+        return
+      case 'sent':
+        await reply(`approve: ${draftId} already sent`, threadTs)
+        return
+      case 'cancelled':
+      case 'failed':
+        await reply(`approve: ${draftId} is ${target.status}, cannot approve`, threadTs)
+        return
+    }
+  }
+
+  async function handleCancel(msg: SlackMessage, threadTs: string): Promise<void> {
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const draftId = extractDraftIdArg(text, 'cancel')
+    if (!draftId) {
+      await reply('format error: expected `cancel <draft-id>`', threadTs)
+      return
+    }
+    const now = Date.now()
+    const entries = listOutboxEntries(OUTBOX_DIR)
+    const target = findEntryByDraftId(entries, draftId)
+    if (!target) {
+      await reply(`cancel: draft_id ${draftId} not found in outbox`, threadTs)
+      return
+    }
+    // Duplicate gate (Codex review on PR #5): refuse to cancel when
+    // multiple files share the draft_id, so neither file is silently
+    // mutated under the bug case.
+    if (findEntriesByDraftId(entries, draftId).length > 1) {
+      await reply(
+        `cancel refused: draft_id ${draftId} has duplicate files in the outbox; manual cleanup required (no transition).`,
+        threadTs,
+      )
+      return
+    }
+    switch (target.status) {
+      case 'pending': {
+        transitionEntry(target, {
+          status: 'cancelled',
+          cancelled_at: new Date(now).toISOString(),
+        })
+        await reply(`cancelled ${draftId}`, threadTs)
+        return
+      }
+      case 'approved': {
+        if (isWithinGrace(target, now)) {
+          transitionEntry(target, {
+            status: 'cancelled',
+            cancelled_at: new Date(now).toISOString(),
+          })
+          await reply(`cancelled ${draftId} (within grace)`, threadTs)
+        } else {
+          await reply(
+            `cancel: too late, ${draftId} grace expired (will dispatch on next sweep)`,
+            threadTs,
+          )
+        }
+        return
+      }
+      case 'sent':
+        await reply(`cancel: too late, ${draftId} already sent`, threadTs)
+        return
+      case 'cancelled':
+      case 'failed':
+        await reply(`cancel: ${draftId} is already ${target.status}`, threadTs)
+        return
+    }
+  }
+
+  async function handlePending(_msg: SlackMessage, threadTs: string): Promise<void> {
+    const entries = listOutboxEntries(OUTBOX_DIR)
+    const pending = filterPending(entries)
+      .slice()
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .slice(0, 5)
+    if (pending.length === 0) {
+      await reply('pending: (no pending drafts)', threadTs)
+      return
+    }
+    const lines = ['pending:']
+    for (const e of pending) {
+      lines.push(renderEntryLine(e))
+    }
+    // Surface duplicate-draft-id state in the pending? reply so Hikaru
+    // sees the bug condition before typing OK / approve.
+    const dups = findDuplicateDraftIds(entries)
+    if (dups.length > 0) {
+      lines.push(`  ⚠️ duplicate draft_id detected: ${dups.join(', ')} (manual cleanup required)`)
+    }
+    await reply(lines.join('\n'), threadTs)
+  }
+
+  /**
+   * Outbox sweep: TTL-expire pending entries and dispatch approved
+   * entries past the grace period (when the abort flag is absent).
+   * Called once per main-loop tick after the inbound poll. Errors
+   * during dispatch are logged + the entry transitions to `failed`.
+   */
+  async function dispatchSweep(): Promise<void> {
+    const now = Date.now()
+    const entries = listOutboxEntries(OUTBOX_DIR)
+    const abortFlagPresent = existsSync(ABORT_FLAG)
+
+    // Compute duplicate draft_ids once per sweep so each transition
+    // can refuse to act on the bug case (per Codex review on PR #5:
+    // duplicates are REJECT, not warn-only).
+    const dupIds = new Set(findDuplicateDraftIds(entries))
+    if (dupIds.size > 0) {
+      console.warn(
+        `[watcher] outbox sweep: skipping duplicate draft_id(s) ${[...dupIds].join(', ')} (manual cleanup required)`,
+      )
+    }
+
+    // 1. TTL-expire pending entries.
+    for (const e of filterPending(entries)) {
+      if (dupIds.has(e.draft_id)) continue
+      if (!isWithinTtl(e, now)) {
+        transitionEntry(e, {
+          status: 'cancelled',
+          cancelled_at: new Date(now).toISOString(),
+          failure_reason: 'ttl-expired',
+        })
+        console.log(`[watcher] outbox auto-cancel ttl-expired: ${e.draft_id}`)
+      }
+    }
+
+    // 2. Dispatch approved entries that cleared the grace period.
+    //    Abort flag holds dispatch (entries stay in `approved` until
+    //    the abort is cleared and a later sweep picks them up).
+    for (const e of filterApproved(entries)) {
+      if (dupIds.has(e.draft_id)) continue
+      if (!shouldDispatch(e, now, abortFlagPresent)) continue
+      if (!e.slack_chat_id) {
+        transitionEntry(e, {
+          status: 'failed',
+          failed_at: new Date(now).toISOString(),
+          failure_reason: 'missing slack_chat_id',
+        })
+        console.error(`[watcher] outbox dispatch failed: ${e.draft_id} missing slack_chat_id`)
+        continue
+      }
+      try {
+        await slack.chat.postMessage({
+          channel: e.slack_chat_id,
+          text: e.body || `(empty draft ${e.draft_id})`,
+          ...(e.slack_thread_ts ? { thread_ts: e.slack_thread_ts } : {}),
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+        transitionEntry(e, {
+          status: 'sent',
+          sent_at: new Date(now).toISOString(),
+        })
+        console.log(`[watcher] outbox dispatched: ${e.draft_id}`)
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        transitionEntry(e, {
+          status: 'failed',
+          failed_at: new Date(now).toISOString(),
+          failure_reason: msg,
+        })
+        console.error(`[watcher] outbox dispatch failed: ${e.draft_id} ${msg}`)
+      }
+    }
+  }
+
   async function dispatch(trigger: Trigger, msg: SlackMessage, threadTs: string): Promise<void> {
     switch (routeTrigger(trigger)) {
       case 'abort-test':
@@ -1108,6 +1444,18 @@ async function main(): Promise<void> {
         break
       case 'codex-review-queue':
         await handleCodexReview(msg, threadTs)
+        break
+      case 'dispatch-ok':
+        await handleOk(msg, threadTs)
+        break
+      case 'dispatch-approve':
+        await handleApprove(msg, threadTs)
+        break
+      case 'dispatch-cancel':
+        await handleCancel(msg, threadTs)
+        break
+      case 'dispatch-pending':
+        await handlePending(msg, threadTs)
         break
       case 'status':
         await handleStatus(threadTs)
@@ -1179,6 +1527,11 @@ async function main(): Promise<void> {
       await poll()
     } catch (e) {
       console.error(`[watcher] poll error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    try {
+      await dispatchSweep()
+    } catch (e) {
+      console.error(`[watcher] dispatch sweep error: ${e instanceof Error ? e.message : String(e)}`)
     }
     if (stop) break
     await new Promise((r) => setTimeout(r, pollIntervalMs))

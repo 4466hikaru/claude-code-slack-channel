@@ -13,17 +13,26 @@ Claude Code session as a `<channel source="slack" ...>` tag in its
 context, but **Claude Code does not generate a response without a
 user turn**. An idle session stays idle.
 
-For six specific prefixes — `[abort-test]`, `[abort]`,
-`[abort cleanup]`, `[codex-review]`, `status?`, and `prs?` — we want
+For ten specific prefixes — `[abort-test]`, `[abort]`,
+`[abort cleanup]`, `[codex-review]`, `OK`, `approve <draft-id>`,
+`cancel <draft-id>`, `pending?`, `status?`, and `prs?` — we want
 immediate scripted responses. A separate watcher process polls Slack
 Web API directly and replies via `chat.postMessage`. Claude Code is
 bypassed entirely.
 
-This is **not** approved-dispatch (no Block Kit confirmation, no
-multi-step approval) — that is deliberately out of scope for this
-iteration. `[codex-review]` performs a queue WRITE only; the actual
-Codex review / merge stays human-gated and is out of scope for the
-watcher (Phase 1 of the codex-review-queue design).
+`[codex-review]` performs a queue WRITE only; the actual Codex review
+/ merge stays human-gated (Phase 1 of the codex-review-queue design).
+
+`OK` / `approve <id>` / `cancel <id>` / `pending?` are the **Phase 1
+approved Codex outbox dispatch** path: Codex writes drafts under
+`handoff/from-codex/`, Hikaru approves via Slack, and the watcher
+dispatches the body to a target Slack channel after a 5s grace
+window. See [`approved-dispatch.md`](approved-dispatch.md) for the
+full state machine, frontmatter shape, and grace / abort interaction.
+
+The watcher does **not** implement Block Kit confirmations or
+multi-step approval; bare `OK` requires three independent conditions
+(unique pending + TTL + thread match) to gate the action.
 
 ## Architecture
 
@@ -57,6 +66,10 @@ Mode, so the prod bridge keeps its singular connection.
 | `[abort]` | `touch` + verify on the abort flag (**create / raise**) | `abort flag created at <path>` |
 | `[abort cleanup]` | `rm -f` + verify-absent on the abort flag | `abort cleanup OK` |
 | `[codex-review]` | parse args (3 forms), reject token-like raw secrets, write/update YAML frontmatter file in the codex-review queue dir | `Codex review queue に登録済み (key=<...>, queue size: N)` |
+| `OK` | resolve unique pending Codex outbox draft (3 conditions), flip status to `approved` | `approved <id>, dispatch 中 (grace 5000ms)` or candidate list / `OK: no pending` |
+| `approve <draft-id>` | explicit approve of a specific outbox draft (idempotent) | `approved <id>, dispatch 中 (grace ...)` or `approve: <id> not found / already <status>` |
+| `cancel <draft-id>` | cancel pending draft, or approved draft within 5s grace | `cancelled <id>` or `cancel: too late, <id> already sent` |
+| `pending?` | list up to 5 pending Codex outbox drafts (oldest first) | `pending:\n  <id>: <summary>\n ...` |
 | `status?` | report watcher / abort-flag / open PR count / blocker | 5-line status text |
 | `prs?` | run `gh pr list --state open` against the 3 active repos and merge results | formatted PR list, max 5 entries total |
 
