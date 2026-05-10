@@ -9,6 +9,7 @@ import {
   filterApproved,
   filterPending,
   findDuplicateDraftIds,
+  findEntriesByDraftId,
   findEntryByDraftId,
   interpretOutboxEntry,
   isWithinGrace,
@@ -352,6 +353,23 @@ describe('find* helpers', () => {
     const b = makeEntry({ draft_id: 'b' })
     expect(findDuplicateDraftIds([a, b])).toEqual([])
     expect(findDuplicateDraftIds([a, a2, b])).toEqual(['a'])
+  })
+
+  test('findEntriesByDraftId returns ALL matches (= duplicate gate input)', () => {
+    // Codex review on PR #5: handlers must REFUSE to act when more
+    // than one file shares the same draft_id rather than silently
+    // mutating only the first match. findEntriesByDraftId surfaces
+    // the count to the caller so it can short-circuit.
+    const a = makeEntry({ draft_id: 'a', path: '/tmp/a-1.md' })
+    const a2 = makeEntry({ draft_id: 'a', path: '/tmp/a-2.md' })
+    const b = makeEntry({ draft_id: 'b' })
+    expect(findEntriesByDraftId([a, a2, b], 'a').length).toBe(2)
+    expect(findEntriesByDraftId([a, a2, b], 'a').map((e) => e.path)).toEqual([
+      '/tmp/a-1.md',
+      '/tmp/a-2.md',
+    ])
+    expect(findEntriesByDraftId([a, a2, b], 'b').length).toBe(1)
+    expect(findEntriesByDraftId([a, a2, b], 'zzz').length).toBe(0)
   })
 })
 

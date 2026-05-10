@@ -110,11 +110,13 @@ import {
   filterApproved,
   filterPending,
   findDuplicateDraftIds,
+  findEntriesByDraftId,
   findEntryByDraftId,
   isWithinGrace,
   isWithinTtl,
   listOutboxEntries,
   OUTBOX_DIR,
+  type OutboxEntry,
   resolveBareOk,
   shouldDispatch,
   summaryLine,
@@ -1157,8 +1159,18 @@ async function main(): Promise<void> {
 
   // --- approved Codex outbox dispatch (bd ccsc-81q Phase 1) ---------
 
+  // Render a candidate / pending line. Includes the Slack target so
+  // Hikaru can see WHERE a dispatch will go BEFORE typing OK / approve
+  // (per Codex review on PR #5: target visibility before approval).
+  function renderEntryLine(entry: OutboxEntry): string {
+    const sum = summaryLine(entry) || '(no summary)'
+    const target = entry.slack_chat_id ?? '(no chat_id)'
+    return `  ${entry.draft_id}: ${sum} -> ${target}`
+  }
+
   async function handleOk(msg: SlackMessage, threadTs: string): Promise<void> {
     const now = Date.now()
+    const userId = typeof msg.user === 'string' ? msg.user : 'hikaru'
     const entries = listOutboxEntries(OUTBOX_DIR)
     const dups = findDuplicateDraftIds(entries)
     if (dups.length > 0) {
@@ -1171,11 +1183,19 @@ async function main(): Promise<void> {
         await reply('OK: no pending drafts.', threadTs)
         return
       }
-      const candLines = result.candidates.map(
-        (c) => `  ${c.draft_id}: ${summaryLine(c) || '(no summary)'}`,
-      )
+      const candLines = result.candidates.map((c) => renderEntryLine(c))
       await reply(
         `OK ambiguous (${result.reason}): use \`approve <draft-id>\` from below:\n${candLines.join('\n')}`,
+        threadTs,
+      )
+      return
+    }
+    // Refuse to approve when the same draft_id appears in multiple
+    // files (= Codex side bug indicator). Per Codex review, both
+    // duplicates stay untouched and Hikaru is asked to resolve.
+    if (findEntriesByDraftId(entries, result.entry.draft_id).length > 1) {
+      await reply(
+        `OK refused: draft_id ${result.entry.draft_id} has duplicate files in the outbox; manual cleanup required (no transition).`,
         threadTs,
       )
       return
@@ -1183,10 +1203,11 @@ async function main(): Promise<void> {
     transitionEntry(result.entry, {
       status: 'approved',
       approved_at: new Date(now).toISOString(),
-      approved_by: 'hikaru',
+      approved_by: userId,
     })
+    const target = result.entry.slack_chat_id ?? '(no chat_id)'
     await reply(
-      `approved ${result.entry.draft_id}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`,
+      `approved ${result.entry.draft_id} -> ${target}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`,
       threadTs,
     )
   }
@@ -1198,20 +1219,48 @@ async function main(): Promise<void> {
       await reply('format error: expected `approve <draft-id>`', threadTs)
       return
     }
+    const userId = typeof msg.user === 'string' ? msg.user : 'hikaru'
+    const now = Date.now()
     const entries = listOutboxEntries(OUTBOX_DIR)
     const target = findEntryByDraftId(entries, draftId)
     if (!target) {
       await reply(`approve: draft_id ${draftId} not found in outbox`, threadTs)
       return
     }
+    // Duplicate gate (Codex review on PR #5).
+    if (findEntriesByDraftId(entries, draftId).length > 1) {
+      await reply(
+        `approve refused: draft_id ${draftId} has duplicate files in the outbox; manual cleanup required (no transition).`,
+        threadTs,
+      )
+      return
+    }
     switch (target.status) {
       case 'pending': {
+        // TTL gate (Codex review on PR #5: bare-OK already checks
+        // TTL via resolveBareOk; explicit approve must too).
+        if (!isWithinTtl(target, now)) {
+          transitionEntry(target, {
+            status: 'cancelled',
+            cancelled_at: new Date(now).toISOString(),
+            failure_reason: 'ttl-expired',
+          })
+          await reply(
+            `approve: ${draftId} ttl expired -> transitioned to cancelled (no dispatch)`,
+            threadTs,
+          )
+          return
+        }
         transitionEntry(target, {
           status: 'approved',
-          approved_at: new Date().toISOString(),
-          approved_by: 'hikaru',
+          approved_at: new Date(now).toISOString(),
+          approved_by: userId,
         })
-        await reply(`approved ${draftId}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`, threadTs)
+        const dispatchTarget = target.slack_chat_id ?? '(no chat_id)'
+        await reply(
+          `approved ${draftId} -> ${dispatchTarget}, dispatch 中 (grace ${APPROVE_GRACE_MS}ms)`,
+          threadTs,
+        )
         return
       }
       case 'approved':
@@ -1239,6 +1288,16 @@ async function main(): Promise<void> {
     const target = findEntryByDraftId(entries, draftId)
     if (!target) {
       await reply(`cancel: draft_id ${draftId} not found in outbox`, threadTs)
+      return
+    }
+    // Duplicate gate (Codex review on PR #5): refuse to cancel when
+    // multiple files share the draft_id, so neither file is silently
+    // mutated under the bug case.
+    if (findEntriesByDraftId(entries, draftId).length > 1) {
+      await reply(
+        `cancel refused: draft_id ${draftId} has duplicate files in the outbox; manual cleanup required (no transition).`,
+        threadTs,
+      )
       return
     }
     switch (target.status) {
@@ -1287,8 +1346,13 @@ async function main(): Promise<void> {
     }
     const lines = ['pending:']
     for (const e of pending) {
-      const sum = summaryLine(e)
-      lines.push(`  ${e.draft_id}: ${sum || '(no summary)'}`)
+      lines.push(renderEntryLine(e))
+    }
+    // Surface duplicate-draft-id state in the pending? reply so Hikaru
+    // sees the bug condition before typing OK / approve.
+    const dups = findDuplicateDraftIds(entries)
+    if (dups.length > 0) {
+      lines.push(`  ⚠️ duplicate draft_id detected: ${dups.join(', ')} (manual cleanup required)`)
     }
     await reply(lines.join('\n'), threadTs)
   }
@@ -1304,8 +1368,19 @@ async function main(): Promise<void> {
     const entries = listOutboxEntries(OUTBOX_DIR)
     const abortFlagPresent = existsSync(ABORT_FLAG)
 
+    // Compute duplicate draft_ids once per sweep so each transition
+    // can refuse to act on the bug case (per Codex review on PR #5:
+    // duplicates are REJECT, not warn-only).
+    const dupIds = new Set(findDuplicateDraftIds(entries))
+    if (dupIds.size > 0) {
+      console.warn(
+        `[watcher] outbox sweep: skipping duplicate draft_id(s) ${[...dupIds].join(', ')} (manual cleanup required)`,
+      )
+    }
+
     // 1. TTL-expire pending entries.
     for (const e of filterPending(entries)) {
+      if (dupIds.has(e.draft_id)) continue
       if (!isWithinTtl(e, now)) {
         transitionEntry(e, {
           status: 'cancelled',
@@ -1320,6 +1395,7 @@ async function main(): Promise<void> {
     //    Abort flag holds dispatch (entries stay in `approved` until
     //    the abort is cleared and a later sweep picks them up).
     for (const e of filterApproved(entries)) {
+      if (dupIds.has(e.draft_id)) continue
       if (!shouldDispatch(e, now, abortFlagPresent)) continue
       if (!e.slack_chat_id) {
         transitionEntry(e, {

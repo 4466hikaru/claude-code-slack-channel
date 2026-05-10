@@ -181,14 +181,28 @@ export function isWithinTtl(entry: OutboxEntry, now: number): boolean {
 }
 
 /**
- * Find an entry by draft_id. Returns null if no match. O(N) but N is
- * bounded by queue size in practice.
+ * Find an entry by draft_id. Returns null if no match. Returns the
+ * first match when multiple files share the same draft_id, but
+ * callers acting on the entry SHOULD first check
+ * `findEntriesByDraftId(...).length > 1` (= duplicate detection)
+ * and refuse to mutate when the bug case is hit.
  */
 export function findEntryByDraftId(entries: OutboxEntry[], draftId: string): OutboxEntry | null {
   for (const e of entries) {
     if (e.draft_id === draftId) return e
   }
   return null
+}
+
+/**
+ * All entries matching `draft_id`. Per Codex review on PR #5,
+ * duplicate-draft-id must be REJECT (not warn-only) — approve,
+ * cancel, and dispatchSweep gate on this length: if > 1, none of
+ * the matching files are mutated and Hikaru is asked to resolve
+ * manually.
+ */
+export function findEntriesByDraftId(entries: OutboxEntry[], draftId: string): OutboxEntry[] {
+  return entries.filter((e) => e.draft_id === draftId)
 }
 
 /**
