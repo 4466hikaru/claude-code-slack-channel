@@ -994,6 +994,300 @@ export function findProjectRequestByMessageId(dir: string, messageId: string): Q
   return null
 }
 
+// --- project channel model Phase 1 (bd ccsc-l34) ----------------------
+
+/**
+ * Slack chat_id channel-type classification. Phase 1 uses a 1-char
+ * prefix heuristic so no `conversations.info` API call is needed. The
+ * classification feeds (a) the queue file's `source_channel_type`
+ * field and (b) the inbound routing decision (DM stays on existing
+ * dispatch path; project-channel routes to channel-aware handlers).
+ *
+ * Mapping:
+ *   `D...` → `dm`
+ *   `C...` → `project-channel` (Phase 1 has no channel registry, so
+ *                                EVERY C-prefixed channel id is
+ *                                considered a project channel; Phase 2
+ *                                may refine via the queue's
+ *                                `project_channel_id` field)
+ *   anything else → `unknown` (e.g. `G...` group, empty, malformed)
+ */
+export type ChannelType = 'dm' | 'project-channel' | 'unknown'
+
+export function classifyChannelType(chatId: string): ChannelType {
+  if (typeof chatId !== 'string' || chatId.length === 0) return 'unknown'
+  if (chatId.startsWith('D')) return 'dm'
+  if (chatId.startsWith('C')) return 'project-channel'
+  return 'unknown'
+}
+
+/**
+ * Non-emergency ops prefixes that, when typed in a non-DM channel,
+ * MUST NOT fire their normal handler / subagent and must instead
+ * trigger a one-line warning that redirects the user to DM.
+ *
+ * This is a superset of the bridge's own TRIGGERS plus the
+ * consultation-session dialogue prefixes (which the bridge does not
+ * normally handle, but it still warns in channel context to keep
+ * the rule consistent for users). DM context is NOT affected — the
+ * existing handler / subagent paths remain authoritative there.
+ */
+export const NON_EMERGENCY_OPS_PREFIXES: readonly string[] = [
+  '[abort-test]',
+  '[abort cleanup]',
+  '[codex-review]',
+  '[整理]',
+  '[tech]',
+  '[product]',
+  '[bizdev]',
+  '[marketing]',
+  '[ops]',
+  '[brainstorm]',
+  'status?',
+  'prs?',
+  'pending?',
+] as const
+
+/**
+ * Return the matched non-emergency ops prefix at the start of `text`,
+ * or null. Mirrors detectTrigger conventions: leading whitespace is
+ * trimmed and the comparison is case-insensitive on the ASCII portion
+ * (Japanese alias like `[整理]` is unchanged by toLowerCase).
+ *
+ * Order: longest-first so `[abort cleanup]` is checked before any
+ * shorter `[abort*` prefix would matter (none in this list — `[abort]`
+ * itself is NOT a non-emergency op, it's emergency, see
+ * detectProjectAbortPrefix).
+ */
+export function detectNonEmergencyOpsPrefix(text: string): string | null {
+  const t = text.trim().toLowerCase()
+  for (const p of NON_EMERGENCY_OPS_PREFIXES) {
+    if (t.startsWith(p.toLowerCase())) return p
+  }
+  return null
+}
+
+/**
+ * True if `text` starts with the emergency `[abort]` prefix (= exact
+ * `[abort]` followed by EOL or space, NOT `[abort cleanup]` or
+ * `[abort-test]`). Case-insensitive.
+ */
+export function detectProjectAbortPrefix(text: string): boolean {
+  const t = text.trim().toLowerCase()
+  if (!t.startsWith('[abort]')) return false
+  // Exact-bracket check is enforced by the literal `]` at position 6:
+  // `[abort cleanup]` -> startsWith `[abort ` (false on `[abort]`)
+  // `[abort-test]`    -> startsWith `[abort-` (false on `[abort]`)
+  return true
+}
+
+/**
+ * Prefixes the watcher silently lets through to the consultation
+ * session (= post-through). These never produce a watcher reply in
+ * channel context regardless of channel type, and the bridge does
+ * not auto-handle them. Phase 2b/2c may layer bridge handling on top.
+ */
+const CHANNEL_PASSTHROUGH_VERBS: readonly string[] = [
+  'approve-impl',
+  'cancel-impl',
+  'approve',
+  'cancel',
+  'ok',
+] as const
+
+function detectPassthroughVerb(text: string): string | null {
+  const t = text.trim().toLowerCase()
+  for (const v of CHANNEL_PASSTHROUGH_VERBS) {
+    if (!t.startsWith(v)) continue
+    const next = t[v.length]
+    // Word boundary: refuse if next char extends the identifier.
+    if (next !== undefined && /[a-z0-9_-]/.test(next)) continue
+    return v
+  }
+  return null
+}
+
+/**
+ * Routing decision for an inbound Slack message under the project
+ * channel model (Phase 1). Pure function — given the message text
+ * and the originating `chat_id`, returns what the dispatch layer
+ * should do. Phase 1 production only ever calls this with `chat_id`
+ * equal to `config.hikaruDmChannel` (= `dm` everywhere), so the
+ * project-channel branches are dormant until Phase 2 wires multi-
+ * channel polling.
+ *
+ * Outcomes:
+ *
+ * - `dm-passthrough`: chat_id is `D...` → existing dispatch path
+ *   handles it (unchanged behavior, regression-free).
+ * - `channel-abort`: chat_id is non-DM AND text starts with the
+ *   emergency `[abort]` prefix → touch `handoff/abort-lv2` and
+ *   dual-notify (channel reply + DM reply).
+ * - `channel-warn`: chat_id is non-DM AND text starts with one of
+ *   the non-emergency ops prefixes → 1-line warning, redirect to DM,
+ *   log; no handler / subagent fires.
+ * - `channel-passthrough`: chat_id is non-DM AND text starts with a
+ *   recognized post-through verb (approve / cancel / OK / -impl
+ *   variants) → silent; consultation session reads the original
+ *   message via its own MCP notification.
+ * - `channel-noop`: chat_id is non-DM AND text matches none of the
+ *   above → silent (= unknown content, no watcher action).
+ * - `unknown-channel-noop`: chat_id is neither D nor C (= `G...`,
+ *   empty, malformed) → silent + log at the dispatch layer. Phase 1
+ *   does not attempt to recover; Phase 2 may add channel registry
+ *   refinement.
+ */
+export type ChannelRouteDecision =
+  | { kind: 'dm-passthrough' }
+  | { kind: 'channel-abort' }
+  | { kind: 'channel-warn'; prefix: string }
+  | { kind: 'channel-passthrough'; verb: string }
+  | { kind: 'channel-noop' }
+  | { kind: 'unknown-channel-noop' }
+
+export function routeInboundMessage(text: string, chatId: string): ChannelRouteDecision {
+  const channelType = classifyChannelType(chatId)
+  if (channelType === 'dm') return { kind: 'dm-passthrough' }
+  if (channelType === 'unknown') return { kind: 'unknown-channel-noop' }
+  // channelType === 'project-channel'
+  if (detectProjectAbortPrefix(text)) return { kind: 'channel-abort' }
+  const nonEmergency = detectNonEmergencyOpsPrefix(text)
+  if (nonEmergency) return { kind: 'channel-warn', prefix: nonEmergency }
+  const verb = detectPassthroughVerb(text)
+  if (verb) return { kind: 'channel-passthrough', verb }
+  return { kind: 'channel-noop' }
+}
+
+/**
+ * Build the channel-side reply text the watcher posts to the project
+ * channel thread when an `[abort]` prefix is received there. Static
+ * for now (= no channel id interpolation); the second leg of the
+ * dual-notify goes to Hikaru's DM via formatChannelAbortDmReply.
+ */
+export function formatChannelAbortChannelReply(abortFlagPath: string = ABORT_FLAG): string {
+  return [
+    'global abort active',
+    `  — ${abortFlagPath} 作成済、全 wake 停止。`,
+    '  再開は DM で `[abort cleanup]`',
+  ].join('\n')
+}
+
+/**
+ * Build the DM-side notification the watcher posts to Hikaru's DM
+ * when an `[abort]` is received from a project channel (= dual notify
+ * so Hikaru sees the event even if not subscribed to the channel).
+ * The channel id is rendered as a Slack mrkdwn channel mention so
+ * the link is clickable.
+ */
+export function formatChannelAbortDmReply(sourceChatId: string, messageTs: string): string {
+  return [
+    `project channel <#${sourceChatId}> で \`[abort]\` 受領 → global abort active`,
+    `  source ts: ${messageTs}`,
+    `  abort flag: ${ABORT_FLAG}`,
+  ].join('\n')
+}
+
+/**
+ * Build the warning reply for non-emergency ops typed in a project
+ * channel. Static one-line redirect to DM.
+ */
+export function formatChannelWarnReply(prefix: string): string {
+  return `\`${prefix}\` は DM で打ってください、channel では受領しません`
+}
+
+/**
+ * Suffix appended to the /new-project ack when the source channel
+ * type is `unknown` (= chat_id starts with neither D nor C). Hikaru
+ * is asked to verify manually because the queue file's
+ * `source_channel_type` will be `unknown` and Phase 2 brief work
+ * relies on that field.
+ */
+export const UNKNOWN_SOURCE_CHANNEL_ACK_SUFFIX =
+  '  ⚠ source channel 不明 (= D / C 以外の chat_id)、Hikaru 確認推奨'
+
+/**
+ * Pure builder for the project-request queue file frontmatter. The
+ * Phase 1 fields (= ccsc-54g, 14 keys) are preserved; the Phase 1
+ * channel-model fields (= ccsc-l34, 7 keys) are appended below.
+ *
+ * Phase 1 sets `project_channel_id` / `project_channel_name` /
+ * `reference_repo` / `target_repo_name` to null and
+ * `template_source` to `"blank"`. Phase 2 (manual brief) and Phase 3
+ * (repo create) fill these in. `source_channel_id` mirrors the
+ * inbound `chat_id` and `source_channel_type` is derived via
+ * `classifyChannelType`. `slack_chat_id` (the original Phase 1 field)
+ * is intentionally kept alongside `source_channel_id` for backward
+ * compatibility; existing queue file parsers do not need to be
+ * updated.
+ */
+export interface ProjectRequestFrontmatterArgs {
+  requestId: string
+  createdAt: Date
+  chatId: string
+  messageId: string
+  threadTs: string
+  rawPrefix: NewProjectTrigger
+}
+
+/**
+ * Pure builder for the Slack ack reply text. Wrapped so handler and
+ * tests share the exact same formatting, including the conditional
+ * lines for truncation, token sanitization, and unknown source
+ * channel.
+ */
+export interface ProjectRequestAckArgs {
+  requestId: string
+  truncated: boolean
+  redactedNames: string[]
+  channelType: ChannelType
+}
+
+export function buildProjectRequestAck(args: ProjectRequestAckArgs): string {
+  const lines = [
+    '📋 project request 起票済',
+    `  id: ${args.requestId}`,
+    '  status: drafting',
+    '  次: Codex の brief 起草を待つ (= Phase 2)',
+  ]
+  if (args.truncated) {
+    lines.push(`  ⚠ 本文 ${NEW_PROJECT_BODY_MAX_BYTES} byte 超を truncate、続報は別 message で`)
+  }
+  if (args.redactedNames.length > 0) {
+    lines.push(`  ⚠ token-like 検出 (${args.redactedNames.join(',')})、sanitize 済`)
+  }
+  if (args.channelType === 'unknown') {
+    lines.push(UNKNOWN_SOURCE_CHANNEL_ACK_SUFFIX)
+  }
+  return lines.join('\n')
+}
+
+export function buildProjectRequestFrontmatter(args: ProjectRequestFrontmatterArgs): Frontmatter {
+  return {
+    type: 'project-request',
+    request_id: args.requestId,
+    created_at: args.createdAt.toISOString(),
+    source: 'desktop-slack',
+    requester: 'hikaru',
+    status: 'drafting',
+    slack_chat_id: args.chatId,
+    slack_message_id: args.messageId,
+    slack_thread_ts: args.threadTs,
+    raw_prefix: args.rawPrefix,
+    project_name: null,
+    project_type: null,
+    target_visibility: 'private',
+    out_of_scope_inherits: 'true',
+    // --- project channel model Phase 1 (bd ccsc-l34) additions ---
+    project_channel_id: null,
+    project_channel_name: null,
+    source_channel_id: args.chatId,
+    source_channel_type: classifyChannelType(args.chatId),
+    template_source: 'blank',
+    reference_repo: null,
+    target_repo_name: null,
+  }
+}
+
 // --- config -----------------------------------------------------------
 
 interface Config {
@@ -1489,22 +1783,21 @@ async function main(): Promise<void> {
 
     const createdAt = new Date()
     const requestId = generateUlid(createdAt.getTime())
-    const fm: Frontmatter = {
-      type: 'project-request',
-      request_id: requestId,
-      created_at: createdAt.toISOString(),
-      source: 'desktop-slack',
-      requester: 'hikaru',
-      status: 'drafting',
-      slack_chat_id: config.hikaruDmChannel,
-      slack_message_id: ts,
-      slack_thread_ts: threadTs,
-      raw_prefix: rawPrefix,
-      project_name: null,
-      project_type: null,
-      target_visibility: 'private',
-      out_of_scope_inherits: 'true',
-    }
+    // Phase 1 watcher polls hikaruDmChannel only, so chatId is always
+    // `config.hikaruDmChannel` here. The chatId is threaded through
+    // buildProjectRequestFrontmatter so that when Phase 2 adds multi-
+    // channel polling and passes a real per-message chat_id, the
+    // queue file fields (= source_channel_id / source_channel_type)
+    // pick up the right value automatically.
+    const chatId = config.hikaruDmChannel
+    const fm = buildProjectRequestFrontmatter({
+      requestId,
+      createdAt,
+      chatId,
+      messageId: ts,
+      threadTs,
+      rawPrefix,
+    })
 
     const filename = projectRequestFilename(createdAt, requestId)
     const path = join(PROJECT_REQUESTS_DIR, filename)
@@ -1525,21 +1818,13 @@ async function main(): Promise<void> {
       return
     }
 
-    const ackLines = [
-      '📋 project request 起票済',
-      `  id: ${requestId}`,
-      '  status: drafting',
-      '  次: Codex の brief 起草を待つ (= Phase 2)',
-    ]
-    if (truncated) {
-      ackLines.push(
-        `  ⚠ 本文 ${NEW_PROJECT_BODY_MAX_BYTES} byte 超を truncate、続報は別 message で`,
-      )
-    }
-    if (redactedNames.length > 0) {
-      ackLines.push(`  ⚠ token-like 検出 (${redactedNames.join(',')})、sanitize 済`)
-    }
-    await reply(ackLines.join('\n'), threadTs)
+    const ack = buildProjectRequestAck({
+      requestId,
+      truncated,
+      redactedNames,
+      channelType: classifyChannelType(chatId),
+    })
+    await reply(ack, threadTs)
   }
 
   // --- approved Codex outbox dispatch (bd ccsc-81q Phase 1) ---------

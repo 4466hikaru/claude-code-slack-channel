@@ -3,9 +3,14 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  buildProjectRequestAck,
+  buildProjectRequestFrontmatter,
   clampPollInterval,
+  classifyChannelType,
   computeQueueKey,
   countActiveEntries,
+  detectNonEmergencyOpsPrefix,
+  detectProjectAbortPrefix,
   detectToken,
   detectTrigger,
   encodeRandomBase32,
@@ -15,21 +20,27 @@ import {
   extractNewProjectBody,
   findEntryByKey,
   findProjectRequestByMessageId,
+  formatChannelAbortChannelReply,
+  formatChannelAbortDmReply,
+  formatChannelWarnReply,
   generateUlid,
   isAllowedSender,
   listProjectRequestEntries,
   listQueueEntries,
   NEW_PROJECT_BODY_MAX_BYTES,
+  NON_EMERGENCY_OPS_PREFIXES,
   parseCodexReview,
   parseFrontmatterFile,
   projectRequestFilename,
   queueFilenameFor,
+  routeInboundMessage,
   routeTrigger,
   sanitizeTokens,
   serializeFrontmatter,
   stripSlackLinkWrap,
   TRIGGERS,
   truncateBodyUtf8,
+  UNKNOWN_SOURCE_CHANNEL_ACK_SUFFIX,
   unescapeYamlString,
 } from './inbound-watcher'
 
@@ -1136,5 +1147,282 @@ describe('listProjectRequestEntries + findProjectRequestByMessageId', () => {
 
   test('empty / missing dir returns []', () => {
     expect(listProjectRequestEntries(join(tmpdir(), `no-dir-${Date.now()}`))).toEqual([])
+  })
+})
+
+// --- bd ccsc-l34: project channel model Phase 1 -----------------
+
+describe('classifyChannelType', () => {
+  test('D-prefixed chat_id → dm', () => {
+    expect(classifyChannelType('D0B2GN71MNE')).toBe('dm')
+    expect(classifyChannelType('DABC')).toBe('dm')
+  })
+
+  test('C-prefixed chat_id → project-channel', () => {
+    expect(classifyChannelType('C1234567890')).toBe('project-channel')
+    expect(classifyChannelType('CABC')).toBe('project-channel')
+  })
+
+  test('G-prefixed / empty / other → unknown', () => {
+    expect(classifyChannelType('G123')).toBe('unknown')
+    expect(classifyChannelType('')).toBe('unknown')
+    expect(classifyChannelType('X999')).toBe('unknown')
+    // non-string defensive: TS suppression to verify runtime guard
+    expect(classifyChannelType(undefined as unknown as string)).toBe('unknown')
+  })
+})
+
+describe('NON_EMERGENCY_OPS_PREFIXES + detectNonEmergencyOpsPrefix', () => {
+  test('all 13 listed prefixes match at start (case-insensitive ascii)', () => {
+    for (const p of NON_EMERGENCY_OPS_PREFIXES) {
+      expect(detectNonEmergencyOpsPrefix(`${p} suffix`)).toBe(p)
+    }
+  })
+
+  test('case-insensitive on ascii prefixes', () => {
+    expect(detectNonEmergencyOpsPrefix('STATUS? today')).toBe('status?')
+    expect(detectNonEmergencyOpsPrefix('[ABORT-TEST]')).toBe('[abort-test]')
+    expect(detectNonEmergencyOpsPrefix('[Tech] q')).toBe('[tech]')
+  })
+
+  test('Japanese alias [整理] (toLowerCase is identity on kanji)', () => {
+    expect(detectNonEmergencyOpsPrefix('[整理] memo')).toBe('[整理]')
+  })
+
+  test('leading whitespace is trimmed', () => {
+    expect(detectNonEmergencyOpsPrefix('  status? ?')).toBe('status?')
+    expect(detectNonEmergencyOpsPrefix('\n\n[tech] q')).toBe('[tech]')
+  })
+
+  test('emergency `[abort]` is NOT in the non-emergency set', () => {
+    expect(detectNonEmergencyOpsPrefix('[abort]')).toBeNull()
+    // sanity: `[abort cleanup]` (= ops, returns) vs `[abort]` (= emergency, null)
+    expect(detectNonEmergencyOpsPrefix('[abort cleanup]')).toBe('[abort cleanup]')
+  })
+
+  test('non-prefix / body-mention returns null', () => {
+    expect(detectNonEmergencyOpsPrefix('hello status?')).toBeNull()
+    expect(detectNonEmergencyOpsPrefix('about [tech] later')).toBeNull()
+    expect(detectNonEmergencyOpsPrefix('')).toBeNull()
+  })
+})
+
+describe('detectProjectAbortPrefix', () => {
+  test('exact `[abort]` → true (case-insensitive, leading WS OK)', () => {
+    expect(detectProjectAbortPrefix('[abort]')).toBe(true)
+    expect(detectProjectAbortPrefix('[ABORT]')).toBe(true)
+    expect(detectProjectAbortPrefix('[Abort]')).toBe(true)
+    expect(detectProjectAbortPrefix('  [abort]')).toBe(true)
+    expect(detectProjectAbortPrefix('[abort] now')).toBe(true)
+  })
+
+  test('`[abort cleanup]` / `[abort-test]` → false (NOT emergency)', () => {
+    expect(detectProjectAbortPrefix('[abort cleanup]')).toBe(false)
+    expect(detectProjectAbortPrefix('[abort-test]')).toBe(false)
+    expect(detectProjectAbortPrefix('[ABORT CLEANUP]')).toBe(false)
+  })
+
+  test('non-prefix / body-mention → false', () => {
+    expect(detectProjectAbortPrefix('hello [abort]')).toBe(false)
+    expect(detectProjectAbortPrefix('')).toBe(false)
+    expect(detectProjectAbortPrefix('please abort')).toBe(false)
+  })
+})
+
+describe('routeInboundMessage', () => {
+  test('DM chat_id → dm-passthrough (existing dispatch path)', () => {
+    expect(routeInboundMessage('status?', 'D0B2GN71MNE')).toEqual({ kind: 'dm-passthrough' })
+    expect(routeInboundMessage('[abort]', 'D0B2GN71MNE')).toEqual({ kind: 'dm-passthrough' })
+    expect(routeInboundMessage('hello', 'D0B2GN71MNE')).toEqual({ kind: 'dm-passthrough' })
+    expect(routeInboundMessage('/new-project foo', 'D0B2GN71MNE')).toEqual({
+      kind: 'dm-passthrough',
+    })
+  })
+
+  test('project channel + `[abort]` → channel-abort (emergency dual-notify)', () => {
+    expect(routeInboundMessage('[abort]', 'C1234567890')).toEqual({ kind: 'channel-abort' })
+    expect(routeInboundMessage('[ABORT]', 'C1234567890')).toEqual({ kind: 'channel-abort' })
+    expect(routeInboundMessage('  [Abort]', 'C1234567890')).toEqual({ kind: 'channel-abort' })
+  })
+
+  test('project channel + non-emergency ops → channel-warn (DM redirect)', () => {
+    expect(routeInboundMessage('status?', 'C1234567890')).toEqual({
+      kind: 'channel-warn',
+      prefix: 'status?',
+    })
+    expect(routeInboundMessage('[abort-test]', 'C1234567890')).toEqual({
+      kind: 'channel-warn',
+      prefix: '[abort-test]',
+    })
+    expect(routeInboundMessage('[abort cleanup]', 'C1234567890')).toEqual({
+      kind: 'channel-warn',
+      prefix: '[abort cleanup]',
+    })
+    expect(routeInboundMessage('[tech] q', 'C1234567890')).toEqual({
+      kind: 'channel-warn',
+      prefix: '[tech]',
+    })
+    expect(routeInboundMessage('[整理] memo', 'C1234567890')).toEqual({
+      kind: 'channel-warn',
+      prefix: '[整理]',
+    })
+  })
+
+  test('project channel + approve/cancel/-impl/ok → channel-passthrough', () => {
+    expect(routeInboundMessage('approve 01HXY', 'C1234567890')).toEqual({
+      kind: 'channel-passthrough',
+      verb: 'approve',
+    })
+    expect(routeInboundMessage('cancel 01HXY', 'C1234567890')).toEqual({
+      kind: 'channel-passthrough',
+      verb: 'cancel',
+    })
+    expect(routeInboundMessage('approve-impl 01HXY', 'C1234567890')).toEqual({
+      kind: 'channel-passthrough',
+      verb: 'approve-impl',
+    })
+    expect(routeInboundMessage('cancel-impl 01HXY', 'C1234567890')).toEqual({
+      kind: 'channel-passthrough',
+      verb: 'cancel-impl',
+    })
+    expect(routeInboundMessage('OK', 'C1234567890')).toEqual({
+      kind: 'channel-passthrough',
+      verb: 'ok',
+    })
+  })
+
+  test('passthrough word-boundary: `approver` is NOT approve', () => {
+    expect(routeInboundMessage('approver wanted', 'C1234567890')).toEqual({ kind: 'channel-noop' })
+    expect(routeInboundMessage('okay then', 'C1234567890')).toEqual({ kind: 'channel-noop' })
+  })
+
+  test('project channel + unrecognized text → channel-noop (silent)', () => {
+    expect(routeInboundMessage('hello world', 'C1234567890')).toEqual({ kind: 'channel-noop' })
+    expect(routeInboundMessage('', 'C1234567890')).toEqual({ kind: 'channel-noop' })
+  })
+
+  test('G-prefixed / unknown chat_id → unknown-channel-noop (silent + log at dispatch)', () => {
+    expect(routeInboundMessage('[abort]', 'G123')).toEqual({ kind: 'unknown-channel-noop' })
+    expect(routeInboundMessage('status?', 'X999')).toEqual({ kind: 'unknown-channel-noop' })
+    expect(routeInboundMessage('hello', '')).toEqual({ kind: 'unknown-channel-noop' })
+  })
+})
+
+describe('formatChannelAbortChannelReply / formatChannelAbortDmReply / formatChannelWarnReply', () => {
+  test('channel reply states `global abort active` + path + recovery hint', () => {
+    const reply = formatChannelAbortChannelReply('/tmp/abort')
+    expect(reply).toContain('global abort active')
+    expect(reply).toContain('/tmp/abort 作成済')
+    expect(reply).toContain('[abort cleanup]')
+  })
+
+  test('DM reply renders source channel as <#...> mrkdwn link + source ts', () => {
+    const reply = formatChannelAbortDmReply('C12345', '1700.123')
+    expect(reply).toContain('<#C12345>')
+    expect(reply).toContain('global abort active')
+    expect(reply).toContain('source ts: 1700.123')
+  })
+
+  test('warn reply names the prefix + DM redirect text', () => {
+    expect(formatChannelWarnReply('status?')).toBe(
+      '`status?` は DM で打ってください、channel では受領しません',
+    )
+    expect(formatChannelWarnReply('[tech]')).toContain('[tech]')
+  })
+})
+
+describe('buildProjectRequestFrontmatter', () => {
+  const baseArgs = {
+    requestId: '01HXY01TESTID0000000000000',
+    createdAt: new Date(Date.UTC(2026, 4, 12, 9, 45, 0)),
+    messageId: '1700.456',
+    threadTs: '1700.456',
+    rawPrefix: '/new-project' as const,
+  }
+
+  test('DM chat_id → source_channel_type=dm, all Phase 1 channel fields null/default', () => {
+    const fm = buildProjectRequestFrontmatter({ ...baseArgs, chatId: 'D0B2GN71MNE' })
+    // Phase 1 ccsc-54g fields preserved
+    expect(fm.type).toBe('project-request')
+    expect(fm.request_id).toBe(baseArgs.requestId)
+    expect(fm.slack_chat_id).toBe('D0B2GN71MNE')
+    expect(fm.raw_prefix).toBe('/new-project')
+    expect(fm.project_name).toBeNull()
+    expect(fm.project_type).toBeNull()
+    expect(fm.target_visibility).toBe('private')
+    expect(fm.out_of_scope_inherits).toBe('true')
+    // Phase 1 ccsc-l34 channel-model fields
+    expect(fm.project_channel_id).toBeNull()
+    expect(fm.project_channel_name).toBeNull()
+    expect(fm.source_channel_id).toBe('D0B2GN71MNE')
+    expect(fm.source_channel_type).toBe('dm')
+    expect(fm.template_source).toBe('blank')
+    expect(fm.reference_repo).toBeNull()
+    expect(fm.target_repo_name).toBeNull()
+  })
+
+  test('C... chat_id → source_channel_type=project-channel', () => {
+    const fm = buildProjectRequestFrontmatter({ ...baseArgs, chatId: 'C1234567890' })
+    expect(fm.source_channel_id).toBe('C1234567890')
+    expect(fm.source_channel_type).toBe('project-channel')
+    // project_channel_id remains null (Phase 1 default, Phase 2 fills it)
+    expect(fm.project_channel_id).toBeNull()
+  })
+
+  test('G... chat_id → source_channel_type=unknown', () => {
+    const fm = buildProjectRequestFrontmatter({ ...baseArgs, chatId: 'G999' })
+    expect(fm.source_channel_id).toBe('G999')
+    expect(fm.source_channel_type).toBe('unknown')
+  })
+
+  test('round-trip: serialize → parseFrontmatterFile preserves all 21 fields', () => {
+    const fm = buildProjectRequestFrontmatter({ ...baseArgs, chatId: 'C1234567890' })
+    const text = `---\n${serializeFrontmatter(fm)}\n---\nbody`
+    const parsed = parseFrontmatterFile(text)
+    expect(parsed).not.toBeNull()
+    if (!parsed) return
+    for (const k of Object.keys(fm)) {
+      expect(parsed.fm[k]).toEqual(fm[k])
+    }
+  })
+})
+
+describe('buildProjectRequestAck', () => {
+  const base = {
+    requestId: '01HXY01ACKID00000000000000',
+    truncated: false,
+    redactedNames: [] as string[],
+    channelType: 'dm' as const,
+  }
+
+  test('minimal ack: id / status / next step only', () => {
+    const ack = buildProjectRequestAck(base)
+    expect(ack).toContain('📋 project request 起票済')
+    expect(ack).toContain('id: 01HXY01ACKID00000000000000')
+    expect(ack).toContain('status: drafting')
+    expect(ack).toContain('Codex の brief 起草を待つ')
+    expect(ack).not.toContain('truncate')
+    expect(ack).not.toContain('sanitize')
+    expect(ack).not.toContain('source channel 不明')
+  })
+
+  test('truncated flag adds line', () => {
+    const ack = buildProjectRequestAck({ ...base, truncated: true })
+    expect(ack).toContain(`${NEW_PROJECT_BODY_MAX_BYTES} byte 超`)
+  })
+
+  test('redacted names flag adds line with name list', () => {
+    const ack = buildProjectRequestAck({ ...base, redactedNames: ['bearer', 'xoxb'] })
+    expect(ack).toContain('token-like 検出 (bearer,xoxb)')
+  })
+
+  test('unknown channel type adds source-channel warning', () => {
+    const ack = buildProjectRequestAck({ ...base, channelType: 'unknown' })
+    expect(ack).toContain(UNKNOWN_SOURCE_CHANNEL_ACK_SUFFIX.trim())
+  })
+
+  test('project-channel type does NOT add unknown warning', () => {
+    const ack = buildProjectRequestAck({ ...base, channelType: 'project-channel' })
+    expect(ack).not.toContain('source channel 不明')
   })
 })

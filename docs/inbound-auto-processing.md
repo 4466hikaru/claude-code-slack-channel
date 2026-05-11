@@ -91,6 +91,67 @@ Failure modes:
 The file is written via tmp-then-rename for atomicity, matching the
 existing `from-execute/processed/` archive convention.
 
+### Project channel model Phase 1 (bd ccsc-l34)
+
+Phase 1 of the project-channel-model design wires two pieces:
+
+**A. Queue file schema extension.** Each `/new-project` / `[新規]`
+write now includes 7 additional flat-YAML fields alongside the
+ccsc-54g fields, so Phase 2 (manual brief) and Phase 3 (repo create)
+have a place to record channel state and template provenance:
+
+```yaml
+# === project channel model (Phase 1 = all null/default; Phase 2+ fills them) ===
+project_channel_id: null            # Slack channel id (C...) — filled by Phase 2 after Hikaru manually creates `proj-<name>`
+project_channel_name: null          # `proj-<project_name>` — filled by Phase 2
+source_channel_id: <inbound chat_id>  # re-tag of `slack_chat_id` under the channel-model namespace
+source_channel_type: dm | project-channel | unknown
+                                    # D... → "dm" / C... → "project-channel" / else → "unknown"
+template_source: blank              # `blank` default; Phase 2 brief may switch to `tracaverse` / other
+reference_repo: null                # e.g. `4466hikaru/tracaverse` — filled by Phase 2
+target_repo_name: null              # derived from `project_name` — filled by Phase 2
+```
+
+`source_channel_type` is derived from the chat_id's first character
+(`D` = DM, `C` = project channel, anything else = `unknown`). No
+`conversations.info` API call is made — Phase 2/B may refine via a
+queue-side `project_channel_id` registry. When the value is
+`unknown` the ack reply appends one extra line asking Hikaru to
+verify.
+
+The existing flat-YAML parser is forward-compatible — old queue files
+without these 7 fields parse without error, and the channel handlers
+only read what they need.
+
+**B. Project-channel inbound routing.** The dispatch layer learns
+five mutually-exclusive routing decisions, returned by the pure
+helper `routeInboundMessage(text, chatId)`:
+
+| decision | trigger | action |
+|---|---|---|
+| `dm-passthrough` | `chat_id` is DM | existing dispatch path (regression-free) |
+| `channel-abort` | non-DM + `[abort]` (exact, case-insensitive) | touch `handoff/abort-lv2` + reply in channel + dual-notify Hikaru's DM |
+| `channel-warn` | non-DM + non-emergency ops prefix (13 listed) | 1-line warning, redirect user to DM, log; no handler/subagent fires |
+| `channel-passthrough` | non-DM + post-through verb (`approve` / `approve-impl` / `cancel` / `cancel-impl` / `OK`) | silent — consultation session reads via MCP |
+| `channel-noop` / `unknown-channel-noop` | non-DM + anything else, or `G...`/empty/malformed chat_id | silent + log at dispatch layer |
+
+The non-emergency ops set covers:
+`[abort-test]` / `[abort cleanup]` / `[codex-review]` /
+`[整理]` / `[tech]` / `[product]` / `[bizdev]` /
+`[marketing]` / `[ops]` / `[brainstorm]` /
+`status?` / `prs?` / `pending?`. `[abort-test]` and
+`[abort cleanup]` stay DM-only by design (= safer to make the user
+acknowledge they're in the right context) — they fall into the
+`channel-warn` bucket.
+
+Phase 1 production polling stays DM-only, so every real-world call
+returns `dm-passthrough` today. The channel-handler code is exercised
+via unit tests and is ready for Phase 2 multi-channel polling to
+flip on. The `[abort]` flag-file mechanism itself
+(`handoff/abort-lv2`) is unchanged — the channel branch is a thin
+wrapper that touches the same path the DM `[abort]` handler touches,
+then layers the dual notify.
+
 ### Executor completion relay (bd ccsc-sbf)
 
 Passive-execution Claude sessions cannot post to Slack themselves
