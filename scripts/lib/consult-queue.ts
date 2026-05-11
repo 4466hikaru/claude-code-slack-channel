@@ -457,10 +457,13 @@ export function buildConsultExecuteAssignment(args: ConsultExecuteAssignmentArgs
     '- Honor the risk_level / prod_gate from the plan.',
     '- Do not touch production data or enable production-facing behavior unless the plan explicitly says the gate allows it.',
     '- Do not expose secrets, .env values, tokens, or private URLs in logs, PRs, or handoff files.',
-    '- If the plan is ambiguous, blocked, or unsafe, stop and write a blocked result to handoff/from-execute/ instead of guessing.',
+    '- If the plan is ambiguous, blocked, or unsafe, stop and write a blocked `type: done` file to handoff/from-execute/ instead of guessing.',
     '',
     '## Result location',
-    `- Write completion to handoff/from-execute/consult-${args.consultId}-result.md`,
+    `- Write completion to handoff/from-execute/done-<UTC yyyy-mm-ddThhmm>-consult-${args.consultId}.md`,
+    '- The completion file MUST match the watcher relay convention: filename starts with `done-` and frontmatter `type: "done"`.',
+    '- Required done frontmatter fields: `type: "done"`, `done_id`, `summary`, `status` (`complete` / `blocked` / `failed`).',
+    '- Set `needs_review: "true"` when Codex/Hikaru review is needed; otherwise set `needs_review: "false"`.',
     '',
   ]
   return lines.join('\n')

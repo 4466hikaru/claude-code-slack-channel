@@ -251,6 +251,10 @@ describe('buildConsultExecuteAssignment', () => {
     expect(content).toContain('テスト相談')
     expect(content).toContain('## Approved Codex plan')
     expect(content).toContain('## Safety / Hard rules')
+    expect(content).toContain('handoff/from-execute/done-<UTC yyyy-mm-ddThhmm>-consult-01CONSULT.md')
+    expect(content).toContain('filename starts with `done-`')
+    expect(content).toContain('type: "done"')
+    expect(content).toContain('status` (`complete` / `blocked` / `failed`)')
   })
 })
 
