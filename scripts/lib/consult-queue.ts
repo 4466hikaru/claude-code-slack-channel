@@ -626,6 +626,78 @@ export function parseHikaruConsultReply(text: string, consultId: string): Hikaru
   return { kind: 'edit', text }
 }
 
+// --- thread reply routing (Codex review #11 fix 2) ------------------
+
+/**
+ * Decision returned by `routeConsultThreadReply` — branches the
+ * watcher thread-reply handler based on the consult queue's current
+ * status. Per Codex review on PR #11: while the consult is still
+ * `pending` (= Codex has not yet posted a plan ack), Hikaru's
+ * thread continuations must be appended to the consult queue's
+ * continuation log rather than dropped as "no trigger". Only after
+ * the plan reply (= status → `planned`) do approve / abort / edit
+ * imperatives become meaningful.
+ */
+export type ConsultThreadRouting =
+  | { kind: 'continuation' } // pending consult → sanitize + append log
+  | { kind: 'parse' } // planned consult → run parseHikaruConsultReply
+  | { kind: 'ignore' } // no active consult / terminal / blocked
+
+/**
+ * Map an active consult-queue entry to the routing decision for a
+ * Hikaru thread reply. Pure function — no FS / Slack side effects.
+ *
+ *  - null consult                  → ignore (= no active consult in this thread)
+ *  - status `pending`              → continuation (= append to log, no parser)
+ *  - status `planned`              → parse (= imperative / permissive / edit / abort)
+ *  - status `approved` / `dispatched` / `cancelled` / `blocked`
+ *    or unknown                    → ignore (= reply handled elsewhere or noise)
+ */
+export function routeConsultThreadReply(consult: { fm: Frontmatter } | null): ConsultThreadRouting {
+  if (!consult) return { kind: 'ignore' }
+  const status = consult.fm.status
+  if (status === 'pending') return { kind: 'continuation' }
+  if (status === 'planned') return { kind: 'parse' }
+  return { kind: 'ignore' }
+}
+
+// --- active-thread tracking after consult plan reply (Codex review #11 fix 1) ---
+
+/**
+ * Decision returned by `trackingForConsultPlanReply` — whether the
+ * dispatch layer should add the plan's Slack thread to the
+ * thread-tracker after a successful Codex plan reply post.
+ *
+ * Per Codex review on PR #11: `consultPlanReplySweep` posts via
+ * `slack.chat.postMessage` directly (= it does NOT go through the
+ * watcher's `reply()` helper, because the helper hardcodes
+ * `config.hikaruDmChannel` while plans can target any channel the
+ * consult originated in). The helper is the only path that records
+ * the threadTs into `activeThreads`, so without this fix a plan
+ * posted more than 15 minutes after the initial consult ack falls
+ * out of the active-thread polling window and the watcher never
+ * picks up Hikaru's "進めて" / `approve <consult_id>` thread reply.
+ *
+ * The fix: after each successful plan post, mark the plan's
+ * `slack_thread_ts` active. This helper returns the policy
+ * (`track: true` always when the threadTs is non-empty) so the
+ * actual `recordThreadReply` + `saveActiveThreads` calls can be
+ * unit-tested at the wire-up site via this contract.
+ */
+export interface ConsultPlanReplyTrackingDecision {
+  track: boolean
+  threadTs: string
+}
+
+export function trackingForConsultPlanReply(plan: {
+  slack_thread_ts: string
+}): ConsultPlanReplyTrackingDecision {
+  if (typeof plan.slack_thread_ts !== 'string' || plan.slack_thread_ts.length === 0) {
+    return { track: false, threadTs: '' }
+  }
+  return { track: true, threadTs: plan.slack_thread_ts }
+}
+
 // --- replies the watcher posts back ---------------------------------
 
 export function formatConsultAckReply(args: {

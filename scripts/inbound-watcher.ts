@@ -147,6 +147,8 @@ import {
   listReadyCodexPlans,
   parseHikaruConsultReply,
   rewriteConsultFrontmatter,
+  routeConsultThreadReply,
+  trackingForConsultPlanReply,
 } from './lib/consult-queue'
 import {
   APPROVE_GRACE_MS,
@@ -2229,35 +2231,67 @@ async function main(): Promise<void> {
         const ts = msg.ts as string
 
         // Mobile Codex Relay Phase 1 (bd ccsc-nwm): when the thread
-        // has an active planned consult queue entry, route ALL Hikaru
-        // replies through the consult reply parser. This wins over
-        // the approved-dispatch verbs because the consult thread is
-        // "owned" by the consult workflow once Codex has posted a
-        // plan ack. The parser still recognises `approve <consult_id>`
-        // / `abort <consult_id>` so the imperative path is preserved.
+        // has an active consult queue entry, route Hikaru replies
+        // based on the consult's status. Codex review #11 fix 2:
+        // status='pending' MUST also be captured here (= sanitize +
+        // append to continuation log) so additional explanations from
+        // Hikaru between consult ack and Codex plan ack are not lost.
+        //   - pending → continuation (= append + sanitize, no parser)
+        //   - planned → parser (= approve/abort/permissive/edit)
+        //   - terminal/blocked/unknown → ignore (= fall through to the
+        //     existing thread-reply trigger dispatch)
         const activeConsult = findConsultByThreadTs(CONSULT_QUEUE_DIR, threadTs, {
           wantActiveOnly: true,
         })
-        if (activeConsult && activeConsult.fm.status === 'planned') {
+        const consultRoute = routeConsultThreadReply(activeConsult)
+        if (consultRoute.kind !== 'ignore') {
           if (msg.user !== config.hikaruUserId) {
             newest = ts
             continue
           }
-          try {
-            await applyConsultReplyDecision(
-              { path: activeConsult.path, fm: activeConsult.fm },
-              text,
-              ts,
-              threadTs,
-            )
-          } catch (e) {
-            console.error(
-              `[watcher] consult reply handler error thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
-            )
+          if (consultRoute.kind === 'continuation' && activeConsult) {
+            // Pending continuation: sanitize body and append to the
+            // consult's continuation log. No Slack reply (= Codex sees
+            // the updated body on next pick). status remains 'pending'.
+            try {
+              const { body: cleanText } = sanitizeTokens(text)
+              appendConsultContinuationLog(activeConsult.path, {
+                text: cleanText,
+                slackMessageId: ts,
+                slackTs: ts,
+              })
+              const rid =
+                typeof activeConsult.fm.request_id === 'string' ? activeConsult.fm.request_id : '?'
+              console.log(
+                `[watcher] consult pending-continuation appended request_id=${rid} ts=${ts}`,
+              )
+            } catch (e) {
+              console.error(
+                `[watcher] consult pending-continuation log failed thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
+              )
+            }
+            newest = ts
+            mutated = true
+            continue
           }
-          newest = ts
-          mutated = true
-          continue
+          // consultRoute.kind === 'parse' → planned consult
+          if (consultRoute.kind === 'parse' && activeConsult) {
+            try {
+              await applyConsultReplyDecision(
+                { path: activeConsult.path, fm: activeConsult.fm },
+                text,
+                ts,
+                threadTs,
+              )
+            } catch (e) {
+              console.error(
+                `[watcher] consult reply handler error thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
+              )
+            }
+            newest = ts
+            mutated = true
+            continue
+          }
         }
 
         const trig = detectTrigger(text)
@@ -2695,6 +2729,30 @@ async function main(): Promise<void> {
         )
       }
       recentlyRelayedConsultPlans.set(plan.plan_id, Date.now())
+
+      // Codex review #11 fix 1: register the consult thread with the
+      // active-thread tracker so `pollThreadReplies` keeps fetching
+      // `conversations.replies` on it. Without this, Hikaru's
+      // imperative reply to a plan posted > 15 min after the consult
+      // ack would never reach `applyConsultReplyDecision`. The
+      // `reply()` helper already does this for posts that target
+      // `config.hikaruDmChannel`; consultPlanReplySweep posts to the
+      // consult's source channel directly so the recording must
+      // happen here.
+      const tracking = trackingForConsultPlanReply({
+        slack_thread_ts: plan.slack_thread_ts,
+      })
+      if (tracking.track) {
+        recordThreadReply(activeThreads, tracking.threadTs, Date.now())
+        try {
+          saveActiveThreads(ACTIVE_THREADS_FILE, activeThreads)
+        } catch (e) {
+          console.error(
+            `[watcher] saveActiveThreads error (consult plan tracking): ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+      }
+
       const note = redactedNames.length > 0 ? ` (sanitized: ${redactedNames.join(',')})` : ''
       console.log(
         `[watcher] consult plan relayed plan_id=${plan.plan_id} consult=${plan.related_consult_id} thread=${plan.slack_thread_ts}${note}`,

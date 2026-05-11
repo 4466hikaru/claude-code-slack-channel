@@ -21,6 +21,8 @@ import {
   parseCodexPlanFile,
   parseHikaruConsultReply,
   rewriteConsultFrontmatter,
+  routeConsultThreadReply,
+  trackingForConsultPlanReply,
 } from './consult-queue'
 
 // ---- isConsultRequest ----------------------------------------------
@@ -600,5 +602,81 @@ describe('formatConsultAckReply', () => {
     expect(r).toContain('ambiguous')
     expect(r).toContain('不明')
     expect(r).toContain('bearer,xoxb')
+  })
+})
+
+// ---- routeConsultThreadReply (Codex review #11 fix 2) --------------
+
+describe('routeConsultThreadReply', () => {
+  test('null consult → ignore (= no active consult for the thread)', () => {
+    expect(routeConsultThreadReply(null)).toEqual({ kind: 'ignore' })
+  })
+
+  test('status pending → continuation (= append to log, do not run parser)', () => {
+    expect(routeConsultThreadReply({ fm: { status: 'pending' } })).toEqual({
+      kind: 'continuation',
+    })
+  })
+
+  test('status planned → parse (= imperative / abort / permissive / edit)', () => {
+    expect(routeConsultThreadReply({ fm: { status: 'planned' } })).toEqual({ kind: 'parse' })
+  })
+
+  test('terminal statuses (approved / dispatched / cancelled / blocked) → ignore', () => {
+    for (const s of ['approved', 'dispatched', 'cancelled', 'blocked']) {
+      expect(routeConsultThreadReply({ fm: { status: s } })).toEqual({ kind: 'ignore' })
+    }
+  })
+
+  test('unknown / missing status → ignore (= defensive default, do nothing)', () => {
+    expect(routeConsultThreadReply({ fm: { status: 'who-knows' } })).toEqual({ kind: 'ignore' })
+    expect(routeConsultThreadReply({ fm: {} })).toEqual({ kind: 'ignore' })
+  })
+
+  test('regression pin: pending threads MUST NOT be ignored (Codex review #11 fix 2)', () => {
+    // Before the fix, pollThreadReplies dropped pending-consult replies
+    // because the inner handler only branched on status==='planned'.
+    // The router now exposes 'continuation' for pending so the wire-up
+    // appends to continuation log.
+    const r = routeConsultThreadReply({ fm: { status: 'pending' } })
+    expect(r.kind).not.toBe('ignore')
+    expect(r.kind).toBe('continuation')
+  })
+})
+
+// ---- trackingForConsultPlanReply (Codex review #11 fix 1) ----------
+
+describe('trackingForConsultPlanReply', () => {
+  test('non-empty slack_thread_ts → track=true with the thread id', () => {
+    expect(trackingForConsultPlanReply({ slack_thread_ts: '1700.456' })).toEqual({
+      track: true,
+      threadTs: '1700.456',
+    })
+  })
+
+  test('empty / missing slack_thread_ts → track=false (= defensive guard)', () => {
+    expect(trackingForConsultPlanReply({ slack_thread_ts: '' })).toEqual({
+      track: false,
+      threadTs: '',
+    })
+    expect(
+      trackingForConsultPlanReply({ slack_thread_ts: undefined as unknown as string }),
+    ).toEqual({ track: false, threadTs: '' })
+    expect(trackingForConsultPlanReply({ slack_thread_ts: null as unknown as string })).toEqual({
+      track: false,
+      threadTs: '',
+    })
+  })
+
+  test('regression pin: plan reply with valid thread_ts MUST yield track=true', () => {
+    // Before the fix, consultPlanReplySweep posted via
+    // slack.chat.postMessage but did NOT record the thread in
+    // activeThreads, so pollThreadReplies stopped polling that thread
+    // after the 15-minute TTL. The contract here is "always track when
+    // the thread id is non-empty"; the wire-up calls recordThreadReply
+    // + saveActiveThreads when this returns track=true.
+    const r = trackingForConsultPlanReply({ slack_thread_ts: 'T1700.456' })
+    expect(r.track).toBe(true)
+    expect(r.threadTs).toBe('T1700.456')
   })
 })
