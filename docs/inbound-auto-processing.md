@@ -341,9 +341,11 @@ sessions receive work through `handoff/to-execute/`, not through Slack
 inbound. The watcher does **not** directly run commands, create PRs,
 merge, or touch production. It only writes a `type: assign` Markdown
 handoff containing the approved plan, original consult, risk metadata,
-and safety rules. If the plan file is missing or malformed, the consult
-is left at `status: approved` and Slack receives a warning instead of a
-silent drop.
+and safety rules. The handoff explicitly tells the executor to write its
+completion as `handoff/from-execute/done-*.md` with `type: done`, so the
+existing executor completion relay can notify Hikaru and archive it. If
+the plan file is missing or malformed, the consult is left at
+`status: approved` and Slack receives a warning instead of a silent drop.
 
 `dispatched` is terminal for the consult thread. Duplicate approvals do
 not create duplicate handoff files because the filename is deterministic
