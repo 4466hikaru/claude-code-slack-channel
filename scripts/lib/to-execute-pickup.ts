@@ -324,11 +324,15 @@ export function formatAssignmentSummary(entry: AssignmentEntry, maxBodyChars = 8
  * (`done-<UTC yyyy-mm-ddThhmm>-<done_id>.md`). Caller may override
  * `now` for tests.
  */
+export function safeDoneIdForFilename(doneId: string): string {
+  return doneId.replace(/[^A-Za-z0-9_.-]/g, '_')
+}
+
 export function recommendedDoneFilename(doneId: string, now: Date = new Date()): string {
   const y = now.getUTCFullYear()
   const m = String(now.getUTCMonth() + 1).padStart(2, '0')
   const d = String(now.getUTCDate()).padStart(2, '0')
   const hh = String(now.getUTCHours()).padStart(2, '0')
   const mi = String(now.getUTCMinutes()).padStart(2, '0')
-  return `done-${y}-${m}-${d}T${hh}${mi}-${doneId}.md`
+  return `done-${y}-${m}-${d}T${hh}${mi}-${safeDoneIdForFilename(doneId)}.md`
 }
