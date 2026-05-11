@@ -64,6 +64,16 @@
  * entries past the 5s grace window dispatch over Slack Web API to
  * their `slack_chat_id` (held while the abort flag is present).
  *
+ * Thread-reply polling (bd ccsc-v5m): in addition to the main DM
+ * `conversations.history` poll, the watcher tracks every threadTs
+ * it has replied into and polls each via `conversations.replies`
+ * on every tick. Thread replies fire ONLY the approved-dispatch
+ * verbs (`OK` / `approve` / `cancel` / `pending?`) — `[abort]` /
+ * `[codex-review]` / `status?` / `prs?` stay main-DM-only to prevent
+ * thread-injection misfire. Active threads have a 15-minute TTL and
+ * are persisted to `$SLACK_STATE_DIR/inbound-watcher.active-threads.json`
+ * so the watcher resumes thread tracking across restarts.
+ *
  * Handler routing is pinned by routeTrigger() + the test file so that
  * the [abort] / [abort cleanup] semantics cannot accidentally flip.
  *
@@ -122,6 +132,16 @@ import {
   summaryLine,
   transitionEntry,
 } from './outbox'
+import {
+  ACTIVE_THREADS_FILE_NAME,
+  type ActiveThreadMap,
+  loadActiveThreads,
+  pruneStaleThreads,
+  recordReply as recordThreadReply,
+  saveActiveThreads,
+  shouldProcessThreadMessage,
+  updateLastSeen as updateThreadCursor,
+} from './thread-tracker'
 
 // --- constants --------------------------------------------------------
 
@@ -130,6 +150,17 @@ const ENV_FILE = join(STATE_DIR, '.env')
 const CONFIG_FILE = join(STATE_DIR, 'inbound-watcher.config.json')
 const LAST_TS_FILE = join(STATE_DIR, 'inbound-watcher.last-ts')
 const LOCK_FILE = join(STATE_DIR, 'inbound-watcher.pid')
+const ACTIVE_THREADS_FILE = join(STATE_DIR, ACTIVE_THREADS_FILE_NAME)
+
+/**
+ * Subset of triggers that thread replies are allowed to fire. Per
+ * bd ccsc-v5m: main DM polling stays open to all 10 triggers, but
+ * thread reply polling restricts to the approved-dispatch verbs so a
+ * thread-injected `[abort]` cannot misfire. `[codex-review]` also
+ * stays main-DM-only (bot reply with that prefix would otherwise
+ * loop back through itself in a thread).
+ */
+const THREAD_REPLY_TRIGGERS: ReadonlySet<string> = new Set(['ok', 'approve', 'cancel', 'pending?'])
 
 // Hardcoded: the single destructive target the watcher is authorized
 // to manipulate. Not env-configurable by design.
@@ -923,8 +954,15 @@ async function main(): Promise<void> {
   let lastTs = existsSync(LAST_TS_FILE)
     ? readFileSync(LAST_TS_FILE, 'utf-8').trim()
     : String(Math.floor(Date.now() / 1000))
+
+  // Active thread tracker (bd ccsc-v5m). Loaded once at startup and
+  // re-saved on every reply / thread sweep so the watcher resumes
+  // tracking after a restart.
+  const activeThreads: ActiveThreadMap = loadActiveThreads(ACTIVE_THREADS_FILE)
+  pruneStaleThreads(activeThreads, Date.now())
+
   console.log(
-    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs}`,
+    `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs} activeThreads=${activeThreads.size}`,
   )
 
   async function reply(text: string, threadTs: string): Promise<void> {
@@ -935,6 +973,18 @@ async function main(): Promise<void> {
       unfurl_links: false,
       unfurl_media: false,
     })
+    // Track every thread the watcher replies into so follow-up Slack
+    // replies (e.g. `approve <id>` typed inside a `pending?` thread)
+    // are picked up by the thread-reply sweep. Refresh TTL on each
+    // reply.
+    recordThreadReply(activeThreads, threadTs, Date.now())
+    try {
+      saveActiveThreads(ACTIVE_THREADS_FILE, activeThreads)
+    } catch (e) {
+      console.error(
+        `[watcher] saveActiveThreads error: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
   }
 
   async function handleAbortTest(threadTs: string): Promise<void> {
@@ -1514,6 +1564,112 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * Thread-reply sweep (bd ccsc-v5m). For every active thread the
+   * watcher previously replied into, poll `conversations.replies`
+   * since the per-thread cursor. New replies feed `dispatch()` ONLY
+   * when the detected trigger is in `THREAD_REPLY_TRIGGERS` and the
+   * sender is allowed by the per-trigger gate (Hikaru-only for
+   * dispatch verbs). Bot self-replies are filtered by the same gate.
+   *
+   * Stale threads are pruned first to bound API usage.
+   */
+  async function pollThreadReplies(): Promise<void> {
+    const now = Date.now()
+    const removed = pruneStaleThreads(activeThreads, now)
+    if (removed.length > 0) {
+      console.log(`[watcher] thread tracker pruned stale: ${removed.join(',')}`)
+    }
+    if (activeThreads.size === 0) return
+
+    let mutated = false
+    // Snapshot keys to avoid mutation-during-iteration if a sweep ends
+    // up modifying activeThreads via reply().
+    const threadIds = Array.from(activeThreads.keys())
+    for (const threadTs of threadIds) {
+      const state = activeThreads.get(threadTs)
+      if (!state) continue
+      let result: Awaited<ReturnType<typeof slack.conversations.replies>>
+      try {
+        result = await slack.conversations.replies({
+          channel: config.hikaruDmChannel,
+          ts: threadTs,
+          oldest: state.lastSeenTs,
+          limit: 50,
+        })
+      } catch (e) {
+        console.error(
+          `[watcher] conversations.replies error thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+        continue
+      }
+      const replies = result.messages ?? []
+      // conversations.replies returns the root first, then children
+      // chronologically. Process in order; cursor advance is per-msg.
+      let newest = state.lastSeenTs
+      for (const msg of replies) {
+        if (!shouldProcessThreadMessage(msg, threadTs, newest)) continue
+        const text = msg.text as string
+        const ts = msg.ts as string
+        const trig = detectTrigger(text)
+        if (!trig) {
+          // Non-trigger message in the thread — advance cursor so we
+          // don't re-evaluate it next sweep.
+          newest = ts
+          continue
+        }
+        if (!THREAD_REPLY_TRIGGERS.has(trig)) {
+          // Trigger detected but not in the thread-reply allowlist
+          // (= [abort] / [codex-review] / status? / prs? routed via
+          // main DM only). Advance cursor; do not dispatch.
+          newest = ts
+          continue
+        }
+        if (
+          !isAllowedSender(
+            msg.user as string | undefined,
+            trig,
+            config.hikaruUserId,
+            codexReviewAllowlist,
+          )
+        ) {
+          newest = ts
+          continue
+        }
+        const replyThread = (msg.thread_ts as string | undefined) ?? ts
+        console.log(
+          `[watcher] thread-reply trigger=${trig} ts=${ts} sender=${msg.user} thread=${replyThread}`,
+        )
+        try {
+          await dispatch(trig, msg as SlackMessage, replyThread)
+        } catch (e) {
+          const errMsg = e instanceof Error ? e.message : String(e)
+          console.error(`[watcher] thread handler ${trig} failed:`, errMsg)
+          try {
+            await reply(`[watcher] handler error for ${trig}: ${errMsg}`, replyThread)
+          } catch {
+            // best effort
+          }
+        }
+        newest = ts
+        mutated = true
+      }
+      if (newest !== state.lastSeenTs) {
+        updateThreadCursor(activeThreads, threadTs, newest)
+        mutated = true
+      }
+    }
+    if (mutated) {
+      try {
+        saveActiveThreads(ACTIVE_THREADS_FILE, activeThreads)
+      } catch (e) {
+        console.error(
+          `[watcher] saveActiveThreads error: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+    }
+  }
+
   let stop = false
   process.on('SIGINT', () => {
     stop = true
@@ -1532,6 +1688,13 @@ async function main(): Promise<void> {
       await dispatchSweep()
     } catch (e) {
       console.error(`[watcher] dispatch sweep error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    try {
+      await pollThreadReplies()
+    } catch (e) {
+      console.error(
+        `[watcher] thread reply sweep error: ${e instanceof Error ? e.message : String(e)}`,
+      )
     }
     if (stop) break
     await new Promise((r) => setTimeout(r, pollIntervalMs))
