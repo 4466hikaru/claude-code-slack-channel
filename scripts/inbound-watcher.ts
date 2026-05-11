@@ -128,14 +128,18 @@ import {
 import {
   analyzeConsultLength,
   appendConsultContinuationLog,
+  buildConsultExecuteAssignment,
   buildConsultFrontmatter,
+  CONSULT_ABORT_ACTIVE_REPLY,
   CONSULT_APPROVED_REPLY,
   CONSULT_CANCELLED_REPLY,
   CONSULT_EDIT_ACK,
   CONSULT_MISMATCH_PROMPT,
   CONSULT_PERMISSIVE_PROMPT,
   CONSULT_QUEUE_DIR,
+  TO_EXECUTE_DIR,
   classifyConsultSourceChannel,
+  consultDispatchFilename,
   consultRequestFilename,
   FROM_CODEX_DIR,
   findConsultByMessageId,
@@ -145,6 +149,7 @@ import {
   isConsultRequest,
   listConsultEntries,
   listReadyCodexPlans,
+  parseCodexPlanFile,
   parseHikaruConsultReply,
   rewriteConsultFrontmatter,
   routeConsultThreadReply,
@@ -2589,17 +2594,94 @@ async function main(): Promise<void> {
     replyThread: string,
   ): Promise<void> {
     const consultId = typeof consult.fm.request_id === 'string' ? consult.fm.request_id : ''
+    if (existsSync(ABORT_FLAG)) {
+      await reply(CONSULT_ABORT_ACTIVE_REPLY(consultId), replyThread)
+      console.log(`[watcher] consult reply skipped: abort flag present request_id=${consultId}`)
+      return
+    }
     const decision = parseHikaruConsultReply(text, consultId)
     switch (decision.kind) {
       case 'approve': {
+        const approvedAt = new Date()
+        const planRef = typeof consult.fm.codex_plan_ref === 'string' ? consult.fm.codex_plan_ref : ''
+        let dispatchPath: string | null = null
+        if (planRef.length > 0) {
+          try {
+            const planContent = readFileSync(planRef, 'utf-8')
+            const plan = parseCodexPlanFile(planContent)
+            if (!plan) {
+              throw new Error(`plan file is not a valid codex-plan: ${planRef}`)
+            }
+            const consultContent = readFileSync(consult.path, 'utf-8')
+            const parsedConsult = parseFrontmatterFile(consultContent)
+            const consultBody = parsedConsult?.body ?? ''
+            const createdRaw =
+              typeof consult.fm.created_at === 'string' ? consult.fm.created_at : undefined
+            const dispatchCreatedAt = createdRaw ? new Date(createdRaw) : approvedAt
+            if (!Number.isFinite(dispatchCreatedAt.getTime())) {
+              throw new Error(`invalid consult created_at: ${createdRaw}`)
+            }
+            mkdirSync(TO_EXECUTE_DIR, { recursive: true })
+            dispatchPath = join(TO_EXECUTE_DIR, consultDispatchFilename(dispatchCreatedAt, consultId))
+            const assignment = buildConsultExecuteAssignment({
+              consultId,
+              createdAt: approvedAt,
+              consultCreatedAt: createdRaw ?? null,
+              sourceChannel:
+                typeof consult.fm.source_channel === 'string' ? consult.fm.source_channel : null,
+              slackThreadTs:
+                typeof consult.fm.slack_thread_ts === 'string' ? consult.fm.slack_thread_ts : null,
+              plan: { ...plan, path: planRef },
+              consultBody,
+            })
+            if (!existsSync(dispatchPath)) {
+              const tmpPath = `${dispatchPath}.tmp.${process.pid}`
+              try {
+                writeFileSync(tmpPath, assignment)
+                renameSync(tmpPath, dispatchPath)
+              } catch (e) {
+                try {
+                  unlinkSync(tmpPath)
+                } catch {
+                  // tmp may not exist; best effort cleanup
+                }
+                throw e
+              }
+            }
+          } catch (e) {
+            const next: Frontmatter = {
+              ...consult.fm,
+              status: 'approved',
+              hikaru_response: 'ok',
+            }
+            rewriteConsultFrontmatter(consult.path, next)
+            const msg = e instanceof Error ? e.message : String(e)
+            await reply(
+              `${CONSULT_APPROVED_REPLY(consultId)}\n⚠ executor dispatch file 作成 NG: ${msg}`,
+              replyThread,
+            )
+            console.error(`[watcher] consult dispatch failed request_id=${consultId}: ${msg}`)
+            return
+          }
+        }
         const next: Frontmatter = {
           ...consult.fm,
-          status: 'approved',
+          status: dispatchPath ? 'dispatched' : 'approved',
           hikaru_response: 'ok',
+          dispatched_to: dispatchPath ?? null,
         }
         rewriteConsultFrontmatter(consult.path, next)
-        await reply(CONSULT_APPROVED_REPLY(consultId), replyThread)
-        console.log(`[watcher] consult approved request_id=${consultId}`)
+        await reply(
+          dispatchPath
+            ? `✅ approved (consult ${consultId})、実行役へ dispatch 済み\n  handoff: ${dispatchPath}`
+            : CONSULT_APPROVED_REPLY(consultId),
+          replyThread,
+        )
+        console.log(
+          dispatchPath
+            ? `[watcher] consult dispatched request_id=${consultId} -> ${dispatchPath}`
+            : `[watcher] consult approved request_id=${consultId}`,
+        )
         return
       }
       case 'abort': {
