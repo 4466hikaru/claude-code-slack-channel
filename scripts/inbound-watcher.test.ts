@@ -8,18 +8,28 @@ import {
   countActiveEntries,
   detectToken,
   detectTrigger,
+  encodeRandomBase32,
+  encodeTimeBase32,
   entryKey,
   escapeYamlString,
+  extractNewProjectBody,
   findEntryByKey,
+  findProjectRequestByMessageId,
+  generateUlid,
   isAllowedSender,
+  listProjectRequestEntries,
   listQueueEntries,
+  NEW_PROJECT_BODY_MAX_BYTES,
   parseCodexReview,
   parseFrontmatterFile,
+  projectRequestFilename,
   queueFilenameFor,
   routeTrigger,
+  sanitizeTokens,
   serializeFrontmatter,
   stripSlackLinkWrap,
   TRIGGERS,
+  truncateBodyUtf8,
   unescapeYamlString,
 } from './inbound-watcher'
 
@@ -873,5 +883,258 @@ describe('parseCodexReview through Slack mrkdwn URL wrap', () => {
     expect(r.form).toBe('repo-pr')
     if (r.form !== 'repo-pr') return
     expect(r.pr_number).toBe(5)
+  })
+})
+
+// --- bd ccsc-54g: /new-project + [新規] prefix --------------------
+
+describe('detectTrigger: /new-project + [新規]', () => {
+  test('exact prefix matches', () => {
+    expect(detectTrigger('/new-project some idea')).toBe('/new-project')
+    expect(detectTrigger('[新規] some idea')).toBe('[新規]')
+  })
+
+  test('case-insensitive on /new-project (ascii); [新規] is exact', () => {
+    expect(detectTrigger('/NEW-PROJECT idea')).toBe('/new-project')
+    expect(detectTrigger('/New-Project idea')).toBe('/new-project')
+    expect(detectTrigger('[新規]idea')).toBe('[新規]')
+  })
+
+  test('no separator after prefix (body starts immediately)', () => {
+    expect(detectTrigger('/new-projectゲーム作りたい')).toBe('/new-project')
+    expect(detectTrigger('[新規]ゲーム作りたい')).toBe('[新規]')
+  })
+
+  test('leading whitespace allowed', () => {
+    expect(detectTrigger('  /new-project idea')).toBe('/new-project')
+    expect(detectTrigger('\n[新規] idea')).toBe('[新規]')
+  })
+
+  test('body-mention does NOT trigger (start-of-message only)', () => {
+    expect(detectTrigger('please use /new-project next time')).toBeNull()
+    expect(detectTrigger('参考: [新規] みたいに送って')).toBeNull()
+  })
+
+  test('full-width alias [ＮＥＷ] does NOT match (only [新規] alias allowed)', () => {
+    expect(detectTrigger('[ＮＥＷ] idea')).toBeNull()
+    expect(detectTrigger('[NEW] idea')).toBeNull()
+  })
+
+  test('does not collide with existing prefixes', () => {
+    // pin: adding /new-project + [新規] must not alter existing resolutions
+    expect(detectTrigger('[abort]')).toBe('[abort]')
+    expect(detectTrigger('[abort cleanup]')).toBe('[abort cleanup]')
+    expect(detectTrigger('[abort-test]')).toBe('[abort-test]')
+    expect(detectTrigger('[codex-review] pr=https://x/1')).toBe('[codex-review]')
+    expect(detectTrigger('status?')).toBe('status?')
+    expect(detectTrigger('prs?')).toBe('prs?')
+    expect(detectTrigger('pending?')).toBe('pending?')
+    expect(detectTrigger('OK')).toBe('ok')
+    expect(detectTrigger('approve x')).toBe('approve')
+    expect(detectTrigger('cancel x')).toBe('cancel')
+  })
+})
+
+describe('TRIGGERS / routeTrigger: /new-project + [新規]', () => {
+  test('TRIGGERS includes both forms', () => {
+    expect(TRIGGERS).toContain('/new-project')
+    expect(TRIGGERS).toContain('[新規]')
+  })
+
+  test('routeTrigger routes both forms to new-project-queue', () => {
+    expect(routeTrigger('/new-project')).toBe('new-project-queue')
+    expect(routeTrigger('[新規]')).toBe('new-project-queue')
+  })
+
+  test('existing routes unchanged (regression pin)', () => {
+    expect(routeTrigger('[abort]')).toBe('abort-create')
+    expect(routeTrigger('[abort cleanup]')).toBe('abort-cleanup')
+    expect(routeTrigger('[abort-test]')).toBe('abort-test')
+    expect(routeTrigger('[codex-review]')).toBe('codex-review-queue')
+    expect(routeTrigger('ok')).toBe('dispatch-ok')
+    expect(routeTrigger('approve')).toBe('dispatch-approve')
+    expect(routeTrigger('cancel')).toBe('dispatch-cancel')
+    expect(routeTrigger('pending?')).toBe('dispatch-pending')
+    expect(routeTrigger('status?')).toBe('status')
+    expect(routeTrigger('prs?')).toBe('prs')
+  })
+})
+
+describe('extractNewProjectBody', () => {
+  test('strips /new-project + single space separator, preserves body case', () => {
+    expect(extractNewProjectBody('/new-project My Game', '/new-project')).toBe('My Game')
+    expect(extractNewProjectBody('/NEW-PROJECT My Game', '/new-project')).toBe('My Game')
+  })
+
+  test('strips [新規] + single space separator', () => {
+    expect(extractNewProjectBody('[新規] ゲーム作る', '[新規]')).toBe('ゲーム作る')
+  })
+
+  test('no separator → body starts immediately', () => {
+    expect(extractNewProjectBody('/new-projectゲーム作る', '/new-project')).toBe('ゲーム作る')
+    expect(extractNewProjectBody('[新規]ゲーム作る', '[新規]')).toBe('ゲーム作る')
+  })
+
+  test('only one leading space dropped; subsequent kept', () => {
+    expect(extractNewProjectBody('/new-project  two-spaces', '/new-project')).toBe(' two-spaces')
+  })
+
+  test('leading newline/tab in body preserved (= they are content, not separator)', () => {
+    expect(extractNewProjectBody('/new-project\nmultiline', '/new-project')).toBe('\nmultiline')
+    expect(extractNewProjectBody('/new-project\tindented', '/new-project')).toBe('\tindented')
+  })
+
+  test('empty body when message is just the prefix', () => {
+    expect(extractNewProjectBody('/new-project', '/new-project')).toBe('')
+    expect(extractNewProjectBody('[新規]', '[新規]')).toBe('')
+    expect(extractNewProjectBody('/new-project ', '/new-project')).toBe('')
+  })
+
+  test('leading whitespace before prefix is stripped (matches detectTrigger)', () => {
+    expect(extractNewProjectBody('  /new-project foo', '/new-project')).toBe('foo')
+  })
+})
+
+describe('truncateBodyUtf8', () => {
+  test('under limit: no truncation, identical body', () => {
+    const r = truncateBodyUtf8('hello', 100)
+    expect(r.truncated).toBe(false)
+    expect(r.body).toBe('hello')
+  })
+
+  test('at limit: no truncation', () => {
+    const s = 'a'.repeat(10)
+    const r = truncateBodyUtf8(s, 10)
+    expect(r.truncated).toBe(false)
+    expect(r.body).toBe(s)
+  })
+
+  test('ascii over limit: cuts to maxBytes exactly', () => {
+    const s = 'a'.repeat(20)
+    const r = truncateBodyUtf8(s, 10)
+    expect(r.truncated).toBe(true)
+    expect(Buffer.byteLength(r.body, 'utf-8')).toBe(10)
+  })
+
+  test('multibyte over limit: cuts on valid UTF-8 boundary (no � tail)', () => {
+    // 'あ' = 3 bytes in UTF-8. 20 chars = 60 bytes.
+    const s = 'あ'.repeat(20)
+    const r = truncateBodyUtf8(s, 10)
+    expect(r.truncated).toBe(true)
+    // result must be valid UTF-8 = multiple of 3 bytes only (no partial char)
+    expect(Buffer.byteLength(r.body, 'utf-8') % 3).toBe(0)
+    expect(Buffer.byteLength(r.body, 'utf-8')).toBeLessThanOrEqual(10)
+    // and the body must round-trip cleanly without replacement char
+    expect(r.body.includes('�')).toBe(false)
+  })
+
+  test('NEW_PROJECT_BODY_MAX_BYTES is the documented 8 KB cap', () => {
+    expect(NEW_PROJECT_BODY_MAX_BYTES).toBe(8192)
+  })
+})
+
+describe('sanitizeTokens', () => {
+  test('no token: body unchanged, no names', () => {
+    const r = sanitizeTokens('plain text with no secrets')
+    expect(r.body).toBe('plain text with no secrets')
+    expect(r.redactedNames).toEqual([])
+  })
+
+  test('single bearer: replaced with [REDACTED:bearer]', () => {
+    const r = sanitizeTokens('header: Bearer abcdefghij1234567890')
+    expect(r.body).toContain('[REDACTED:bearer]')
+    expect(r.body).not.toContain('abcdefghij')
+    expect(r.redactedNames).toEqual(['bearer'])
+  })
+
+  test('multiple distinct patterns: all redacted, names listed once each', () => {
+    const r = sanitizeTokens('xoxb-ABCDEFGHIJ1234567890 and sk-ABCDEFGHIJKLMNOPQRSTUVWX')
+    expect(r.body).toContain('[REDACTED:xoxb]')
+    expect(r.body).toContain('[REDACTED:sk]')
+    expect(r.redactedNames).toEqual(['xoxb', 'sk'])
+  })
+
+  test('multiple occurrences of same pattern: all replaced, name listed once', () => {
+    const r = sanitizeTokens('one xoxb-AAAAAAAAAAAAAAAAAAAA and two xoxb-BBBBBBBBBBBBBBBBBBBB')
+    expect((r.body.match(/\[REDACTED:xoxb\]/g) ?? []).length).toBe(2)
+    expect(r.redactedNames).toEqual(['xoxb'])
+  })
+})
+
+describe('encodeTimeBase32 / encodeRandomBase32 / generateUlid', () => {
+  test('encodeTimeBase32: deterministic, length-correct', () => {
+    expect(encodeTimeBase32(0, 10)).toBe('0000000000')
+    expect(encodeTimeBase32(31, 10).endsWith('Z')).toBe(true)
+    expect(encodeTimeBase32(32, 10).endsWith('10')).toBe(true)
+  })
+
+  test('encodeRandomBase32: deterministic given bytes', () => {
+    const bytes = new Uint8Array([0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff])
+    expect(encodeRandomBase32(bytes, 16)).toBe('ZZZZZZZZZZZZZZZZ')
+    const zeros = new Uint8Array(10)
+    expect(encodeRandomBase32(zeros, 16)).toBe('0000000000000000')
+  })
+
+  test('generateUlid: 26 chars, Crockford alphabet only', () => {
+    const id = generateUlid(0, new Uint8Array(10))
+    expect(id).toBe('00000000000000000000000000')
+    expect(id.length).toBe(26)
+    const rand = generateUlid()
+    expect(rand.length).toBe(26)
+    expect(/^[0-9A-HJKMNP-TV-Z]+$/.test(rand)).toBe(true)
+  })
+
+  test('generateUlid: time prefix monotonic for monotonic clock', () => {
+    const a = generateUlid(1_000_000, new Uint8Array(10))
+    const b = generateUlid(1_000_001, new Uint8Array(10))
+    expect(a.slice(0, 10) <= b.slice(0, 10)).toBe(true)
+  })
+})
+
+describe('projectRequestFilename', () => {
+  test('format: <UTC yyyy-mm-ddThhmm>-<id>.md', () => {
+    const d = new Date(Date.UTC(2026, 4, 11, 9, 45, 0)) // 2026-05-11T09:45Z
+    const name = projectRequestFilename(d, '01HXY01TESTID0000000000000')
+    expect(name).toBe('2026-05-11T0945-01HXY01TESTID0000000000000.md')
+  })
+})
+
+describe('listProjectRequestEntries + findProjectRequestByMessageId', () => {
+  test('filters by type=project-request, ignores other types', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'project-requests-test-'))
+    try {
+      writeFileSync(
+        join(dir, '2026-05-11T0945-A.md'),
+        '---\ntype: "project-request"\nrequest_id: "A"\nstatus: "drafting"\nslack_message_id: "111.1"\n---\nbody A',
+      )
+      writeFileSync(
+        join(dir, '2026-05-11T0946-B.md'),
+        '---\ntype: "project-request"\nrequest_id: "B"\nstatus: "drafting"\nslack_message_id: "222.2"\n---\nbody B',
+      )
+      // wrong type → filtered out
+      writeFileSync(
+        join(dir, '2026-05-11T0947-C.md'),
+        '---\ntype: "done"\ndone_id: "C"\nstatus: "complete"\n---\nbody C',
+      )
+      // missing frontmatter → skipped
+      writeFileSync(join(dir, 'junk.md'), 'no frontmatter')
+      // non-md → skipped
+      writeFileSync(join(dir, 'note.txt'), 'irrelevant')
+
+      const entries = listProjectRequestEntries(dir)
+      expect(entries.map((e) => e.fm.request_id).sort()).toEqual(['A', 'B'])
+
+      expect(findProjectRequestByMessageId(dir, '111.1')?.fm.request_id).toBe('A')
+      expect(findProjectRequestByMessageId(dir, '222.2')?.fm.request_id).toBe('B')
+      expect(findProjectRequestByMessageId(dir, '999.9')).toBeNull()
+      // empty messageId → null (= short-circuit)
+      expect(findProjectRequestByMessageId(dir, '')).toBeNull()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('empty / missing dir returns []', () => {
+    expect(listProjectRequestEntries(join(tmpdir(), `no-dir-${Date.now()}`))).toEqual([])
   })
 })

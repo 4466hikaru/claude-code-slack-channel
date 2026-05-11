@@ -13,15 +13,20 @@ Claude Code session as a `<channel source="slack" ...>` tag in its
 context, but **Claude Code does not generate a response without a
 user turn**. An idle session stays idle.
 
-For ten specific prefixes — `[abort-test]`, `[abort]`,
-`[abort cleanup]`, `[codex-review]`, `OK`, `approve <draft-id>`,
-`cancel <draft-id>`, `pending?`, `status?`, and `prs?` — we want
-immediate scripted responses. A separate watcher process polls Slack
-Web API directly and replies via `chat.postMessage`. Claude Code is
-bypassed entirely.
+For twelve specific prefixes — `[abort-test]`, `[abort]`,
+`[abort cleanup]`, `[codex-review]`, `/new-project`, `[新規]`,
+`OK`, `approve <draft-id>`, `cancel <draft-id>`, `pending?`,
+`status?`, and `prs?` — we want immediate scripted responses. A
+separate watcher process polls Slack Web API directly and replies
+via `chat.postMessage`. Claude Code is bypassed entirely.
 
 `[codex-review]` performs a queue WRITE only; the actual Codex review
 / merge stays human-gated (Phase 1 of the codex-review-queue design).
+
+`/new-project` and `[新規]` (= aliases) write a project-request file
+to `handoff/project-requests/` (Phase 1 of the new-project-bootstrap
+design, bd `ccsc-54g`). Repo creation / Codex brief / approved
+dispatch are Phase 2+ and NOT triggered here.
 
 `OK` / `approve <id>` / `cancel <id>` / `pending?` are the **Phase 1
 approved Codex outbox dispatch** path: Codex writes drafts under
@@ -33,6 +38,58 @@ full state machine, frontmatter shape, and grace / abort interaction.
 The watcher does **not** implement Block Kit confirmations or
 multi-step approval; bare `OK` requires three independent conditions
 (unique pending + TTL + thread match) to gate the action.
+
+### `/new-project` + `[新規]` request queue (bd ccsc-54g)
+
+Inbound `/new-project <body>` (case-insensitive) or `[新規] <body>`
+(Japanese alias) writes a flat YAML frontmatter file to
+
+```
+/home/hikaru/projects/hikaru-agent-knowledge/handoff/project-requests/
+```
+
+with `type: project-request`, a fresh ULID `request_id`,
+`status: drafting`, the Slack `chat_id` / `message_id` / `thread_ts`
+of the originating message, `raw_prefix` (`/new-project` or
+`[新規]`), and brief fields (`project_name` / `project_type`) set to
+`null` for Phase 2 (Codex brief) to fill in. The body of the Slack
+message is transcribed verbatim (less the prefix and one optional
+space separator) into the file body.
+
+The watcher then posts a Slack ack reply in the same thread:
+
+```
+📋 project request 起票済
+  id: <request_id>
+  status: drafting
+  次: Codex の brief 起草を待つ (= Phase 2)
+```
+
+Phase 1 deliberately stops here. Repo creation (`gh repo create`),
+Codex brief generation, approved dispatch entry, and the executor
+initial PR all live in later phases and are NOT triggered by this
+prefix.
+
+Failure modes:
+
+- **abort flag present**: skip + reply (= existing flag semantics
+  honoured, no exceptions).
+- **empty body** (= prefix only): reply prompt asking for at least
+  one line of content; no queue write.
+- **body > 8 KB**: UTF-8-safe truncate at 8192 bytes; ack flags
+  the truncation.
+- **token-like content** (= `Bearer ` / `xoxb-` / `xapp-` / `sk-` /
+  `ghp_` / `ghs_`): sanitize with `[REDACTED:<name>]` before writing,
+  ack flags which patterns fired. The raw secret never reaches the
+  queue file or the Slack ack.
+- **same Slack `message_id` already queued**: idempotent no-op
+  reply (= covers re-presentation after a watcher restart with an
+  earlier `lastTs`).
+- **mkdir / write failure**: reply with the error message, no
+  retry (= Hikaru is expected to re-send when the cause is fixed).
+
+The file is written via tmp-then-rename for atomicity, matching the
+existing `from-execute/processed/` archive convention.
 
 ### Executor completion relay (bd ccsc-sbf)
 
@@ -106,6 +163,8 @@ Mode, so the prod bridge keeps its singular connection.
 | `[abort]` | `touch` + verify on the abort flag (**create / raise**) | `abort flag created at <path>` |
 | `[abort cleanup]` | `rm -f` + verify-absent on the abort flag | `abort cleanup OK` |
 | `[codex-review]` | parse args (3 forms), reject token-like raw secrets, write/update YAML frontmatter file in the codex-review queue dir | `Codex review queue に登録済み (key=<...>, queue size: N)` |
+| `/new-project <body>` | strip prefix + one optional space, truncate to 8 KB, sanitize token-like content, write `type: project-request` frontmatter file in `handoff/project-requests/` | `📋 project request 起票済\n  id: <ulid>\n  status: drafting\n  次: Codex の brief 起草を待つ (= Phase 2)` |
+| `[新規] <body>` | Japanese alias of `/new-project`; same handler, `raw_prefix: "[新規]"` recorded | same as above |
 | `OK` | resolve unique pending Codex outbox draft (3 conditions), flip status to `approved` | `approved <id>, dispatch 中 (grace 5000ms)` or candidate list / `OK: no pending` |
 | `approve <draft-id>` | explicit approve of a specific outbox draft (idempotent) | `approved <id>, dispatch 中 (grace ...)` or `approve: <id> not found / already <status>` |
 | `cancel <draft-id>` | cancel pending draft, or approved draft within 5s grace | `cancelled <id>` or `cancel: too late, <id> already sent` |

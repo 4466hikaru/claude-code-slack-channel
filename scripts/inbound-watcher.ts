@@ -108,6 +108,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs'
@@ -182,6 +183,16 @@ const ABORT_FLAG = '/home/hikaru/projects/hikaru-agent-knowledge/handoff/abort-l
 const CODEX_REVIEW_QUEUE_DIR =
   '/home/hikaru/projects/hikaru-agent-knowledge/handoff/codex-review-queue'
 
+// Hardcoded absolute path of the new-project request queue dir (bd
+// ccsc-54g Phase 1). Created on first write, never removed by the
+// watcher. NOT env-configurable in production.
+export const PROJECT_REQUESTS_DIR =
+  '/home/hikaru/projects/hikaru-agent-knowledge/handoff/project-requests'
+
+// Cap on the body bytes the watcher will write into a project-request
+// queue file. Excess body is truncated and the ack flags it.
+export const NEW_PROJECT_BODY_MAX_BYTES = 8192
+
 // Queue size caps for [codex-review]. Counts pending + blocked entries
 // only (reviewed entries are excluded by countActiveEntries()).
 const MAX_QUEUE_PENDING = 50
@@ -215,6 +226,8 @@ export const TRIGGERS = [
   '[abort cleanup]',
   '[abort]',
   '[codex-review]',
+  '[新規]',
+  '/new-project',
   'approve',
   'cancel',
   'ok',
@@ -229,6 +242,7 @@ export type TriggerAction =
   | 'abort-create'
   | 'abort-cleanup'
   | 'codex-review-queue'
+  | 'new-project-queue'
   | 'dispatch-ok'
   | 'dispatch-approve'
   | 'dispatch-cancel'
@@ -287,6 +301,9 @@ export function routeTrigger(trigger: Trigger): TriggerAction {
       return 'abort-cleanup'
     case '[codex-review]':
       return 'codex-review-queue'
+    case '[新規]':
+    case '/new-project':
+      return 'new-project-queue'
     case 'ok':
       return 'dispatch-ok'
     case 'approve':
@@ -795,6 +812,188 @@ export function countActiveEntries(entries: QueueEntry[]): number {
   return n
 }
 
+// --- /new-project queue helpers (bd ccsc-54g Phase 1) ----------------
+
+/**
+ * Canonical /new-project trigger forms. Used to type-guard handler
+ * branches and to distinguish the slash form from the Japanese alias
+ * when recording `raw_prefix` in the queue file.
+ */
+export type NewProjectTrigger = '/new-project' | '[新規]'
+
+const ULID_ALPHABET = '0123456789ABCDEFGHJKMNPQRSTVWXYZ' as const
+
+/**
+ * Encode `time` (ms) as `length` Crockford-base32 chars, MSB-first.
+ * length=10 covers ~ year 10889 for ms timestamps, matching ULID.
+ */
+export function encodeTimeBase32(time: number, length: number): string {
+  let t = time
+  const chars: string[] = []
+  for (let i = 0; i < length; i++) {
+    chars.unshift(ULID_ALPHABET[t % 32])
+    t = Math.floor(t / 32)
+  }
+  return chars.join('')
+}
+
+/**
+ * Encode `bytes` as `length` Crockford-base32 chars (5 bits / char).
+ * Caller supplies enough random bytes (length * 5 / 8 rounded up).
+ */
+export function encodeRandomBase32(bytes: Uint8Array, length: number): string {
+  let bits = 0
+  let value = 0
+  let out = ''
+  for (let i = 0; i < bytes.length && out.length < length; i++) {
+    value = (value << 8) | bytes[i]
+    bits += 8
+    while (bits >= 5 && out.length < length) {
+      out += ULID_ALPHABET[(value >>> (bits - 5)) & 0x1f]
+      bits -= 5
+    }
+  }
+  if (out.length < length && bits > 0) {
+    out += ULID_ALPHABET[(value << (5 - bits)) & 0x1f]
+  }
+  while (out.length < length) out += '0'
+  return out
+}
+
+/**
+ * Generate a 26-char Crockford-base32 ULID (10 time + 16 random).
+ * `now` defaults to `Date.now()`; `randomBytes` defaults to 10 bytes
+ * from `crypto.getRandomValues`. Both are injectable for tests.
+ */
+export function generateUlid(now: number = Date.now(), randomBytes?: Uint8Array): string {
+  const t = encodeTimeBase32(now, 10)
+  let r = randomBytes
+  if (!r) {
+    r = new Uint8Array(10)
+    if (typeof crypto !== 'undefined' && 'getRandomValues' in crypto) {
+      crypto.getRandomValues(r)
+    } else {
+      for (let i = 0; i < 10; i++) r[i] = Math.floor(Math.random() * 256)
+    }
+  }
+  return t + encodeRandomBase32(r, 16)
+}
+
+/**
+ * Strip the `/new-project` or `[新規]` prefix from the start of the
+ * message, preserving the original case of the body (= detectTrigger
+ * only lowercases for matching; the actual body must keep user case).
+ * One leading space after the prefix is treated as a cosmetic
+ * separator and dropped. Newlines / tabs after the prefix are kept
+ * (they are part of the body).
+ */
+export function extractNewProjectBody(text: string, prefix: NewProjectTrigger): string {
+  const trimmed = text.trimStart()
+  const lower = trimmed.toLowerCase()
+  if (!lower.startsWith(prefix)) return ''
+  const rest = trimmed.slice(prefix.length)
+  return rest.startsWith(' ') ? rest.slice(1) : rest
+}
+
+/**
+ * Truncate a string to at most `maxBytes` bytes when encoded as UTF-8,
+ * cutting on a valid UTF-8 boundary so the result is well-formed. The
+ * caller flags the user that truncation happened.
+ */
+export function truncateBodyUtf8(
+  body: string,
+  maxBytes: number,
+): { body: string; truncated: boolean } {
+  const buf = Buffer.from(body, 'utf-8')
+  if (buf.byteLength <= maxBytes) return { body, truncated: false }
+  let cut = maxBytes
+  while (cut > 0) {
+    const candidate = buf.subarray(0, cut).toString('utf-8')
+    if (!candidate.endsWith('�')) return { body: candidate, truncated: true }
+    cut--
+  }
+  return { body: '', truncated: true }
+}
+
+/**
+ * Replace every token-like substring (matching TOKEN_PATTERNS) with
+ * `[REDACTED:<name>]`. Returns the sanitized body and the list of
+ * pattern names that fired (deduped, insertion order). The watcher
+ * uses the names to flag the user in the ack reply without echoing
+ * the raw secret.
+ */
+export function sanitizeTokens(body: string): { body: string; redactedNames: string[] } {
+  let result = body
+  const names: string[] = []
+  for (const { name, pattern } of TOKEN_PATTERNS) {
+    const reGlobal = new RegExp(
+      pattern.source,
+      pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`,
+    )
+    if (reGlobal.test(result)) {
+      names.push(name)
+      result = result.replace(reGlobal, `[REDACTED:${name}]`)
+    }
+  }
+  return { body: result, redactedNames: names }
+}
+
+/**
+ * Compose the queue filename for a project request:
+ *   `<created-iso-no-colon>-<request_id>.md`
+ *
+ * Example: `2026-05-12T0945-01HXY01NEWPROJ0ABC123.md`. Matches the
+ * filename convention of `from-execute/done-*.md` archive.
+ */
+export function projectRequestFilename(createdAt: Date, requestId: string): string {
+  const yyyy = createdAt.getUTCFullYear()
+  const mm = String(createdAt.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(createdAt.getUTCDate()).padStart(2, '0')
+  const hh = String(createdAt.getUTCHours()).padStart(2, '0')
+  const mi = String(createdAt.getUTCMinutes()).padStart(2, '0')
+  return `${yyyy}-${mm}-${dd}T${hh}${mi}-${requestId}.md`
+}
+
+/**
+ * List parseable project-request entries in `dir`. Filters by
+ * `type: project-request` so any unrelated files in the dir are
+ * ignored. Returns an empty array if the dir does not exist.
+ */
+export function listProjectRequestEntries(dir: string): QueueEntry[] {
+  if (!existsSync(dir)) return []
+  const out: QueueEntry[] = []
+  for (const name of readdirSync(dir)) {
+    if (!name.endsWith('.md')) continue
+    const path = join(dir, name)
+    let content: string
+    try {
+      content = readFileSync(path, 'utf-8')
+    } catch {
+      continue
+    }
+    const parsed = parseFrontmatterFile(content)
+    if (!parsed) continue
+    if (parsed.fm.type !== 'project-request') continue
+    out.push({ path, fm: parsed.fm, body: parsed.body })
+  }
+  return out
+}
+
+/**
+ * Idempotency check: was a project-request already queued for this
+ * Slack `message_id`? Returns the entry if so, null otherwise. The
+ * handler uses this to skip duplicate writes when the same message
+ * is re-presented by `conversations.history` (e.g. after a watcher
+ * restart with an earlier `lastTs`).
+ */
+export function findProjectRequestByMessageId(dir: string, messageId: string): QueueEntry | null {
+  if (messageId.length === 0) return null
+  for (const e of listProjectRequestEntries(dir)) {
+    if (e.fm.slack_message_id === messageId) return e
+  }
+  return null
+}
+
 // --- config -----------------------------------------------------------
 
 interface Config {
@@ -1225,6 +1424,124 @@ async function main(): Promise<void> {
     await reply(line, threadTs)
   }
 
+  // --- /new-project request queue (bd ccsc-54g Phase 1) -------------
+
+  /**
+   * Handle the `/new-project` and `[新規]` prefixes. Writes a flat
+   * YAML frontmatter file under PROJECT_REQUESTS_DIR with status
+   * `drafting` and posts a Slack ack. The handler does NOT dispatch
+   * Codex, does NOT create a repo, and does NOT alter approved
+   * dispatch / executor relay state. Phase 2+ pick up the queue
+   * file from there.
+   *
+   * Failure modes:
+   * - abort flag present → skip + reply (= existing flag semantics)
+   * - empty body (= prefix only) → reply prompt, no queue write
+   * - body > NEW_PROJECT_BODY_MAX_BYTES → truncate, ack flags it
+   * - body has token-like content → sanitize before write, ack flags it
+   * - same Slack message_id already queued → no-op idempotent reply
+   * - mkdir / write failure → reply error, no retry
+   */
+  async function handleNewProjectRequest(msg: SlackMessage, threadTs: string): Promise<void> {
+    if (existsSync(ABORT_FLAG)) {
+      await reply(
+        `[new-project] abort flag present at ${ABORT_FLAG}; queue write skipped.`,
+        threadTs,
+      )
+      return
+    }
+
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const ts = typeof msg.ts === 'string' ? msg.ts : ''
+    const trig = detectTrigger(text)
+    if (trig !== '[新規]' && trig !== '/new-project') return
+    const rawPrefix: NewProjectTrigger = trig
+
+    const body0 = extractNewProjectBody(text, rawPrefix)
+    if (body0.trim().length === 0) {
+      await reply(
+        `[new-project] 本文が空です。例: \`/new-project <project の概要 1 行以上>\``,
+        threadTs,
+      )
+      return
+    }
+
+    const { body: bodyTrunc, truncated } = truncateBodyUtf8(body0, NEW_PROJECT_BODY_MAX_BYTES)
+    const { body: bodyClean, redactedNames } = sanitizeTokens(bodyTrunc)
+
+    try {
+      mkdirSync(PROJECT_REQUESTS_DIR, { recursive: true })
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      await reply(`[new-project] queue dir 作成失敗: ${m}`, threadTs)
+      return
+    }
+
+    const existing = findProjectRequestByMessageId(PROJECT_REQUESTS_DIR, ts)
+    if (existing) {
+      const existingId = typeof existing.fm.request_id === 'string' ? existing.fm.request_id : '?'
+      await reply(
+        `[new-project] 既に queue 起票済 (id=${existingId}, slack_message_id=${ts})、no-op.`,
+        threadTs,
+      )
+      return
+    }
+
+    const createdAt = new Date()
+    const requestId = generateUlid(createdAt.getTime())
+    const fm: Frontmatter = {
+      type: 'project-request',
+      request_id: requestId,
+      created_at: createdAt.toISOString(),
+      source: 'desktop-slack',
+      requester: 'hikaru',
+      status: 'drafting',
+      slack_chat_id: config.hikaruDmChannel,
+      slack_message_id: ts,
+      slack_thread_ts: threadTs,
+      raw_prefix: rawPrefix,
+      project_name: null,
+      project_type: null,
+      target_visibility: 'private',
+      out_of_scope_inherits: 'true',
+    }
+
+    const filename = projectRequestFilename(createdAt, requestId)
+    const path = join(PROJECT_REQUESTS_DIR, filename)
+    const content = `---\n${serializeFrontmatter(fm)}\n---\n${bodyClean}`
+    const tmpPath = `${path}.tmp.${process.pid}`
+    try {
+      writeFileSync(tmpPath, content)
+      renameSync(tmpPath, path)
+    } catch (e) {
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        // tmp file may not exist if writeFileSync failed before creating it
+      }
+      const m = e instanceof Error ? e.message : String(e)
+      await reply(`[new-project] queue 起票 NG (bridge log 確認要): ${m}`, threadTs)
+      console.error(`[watcher] new-project queue write failed: ${m}`)
+      return
+    }
+
+    const ackLines = [
+      '📋 project request 起票済',
+      `  id: ${requestId}`,
+      '  status: drafting',
+      '  次: Codex の brief 起草を待つ (= Phase 2)',
+    ]
+    if (truncated) {
+      ackLines.push(
+        `  ⚠ 本文 ${NEW_PROJECT_BODY_MAX_BYTES} byte 超を truncate、続報は別 message で`,
+      )
+    }
+    if (redactedNames.length > 0) {
+      ackLines.push(`  ⚠ token-like 検出 (${redactedNames.join(',')})、sanitize 済`)
+    }
+    await reply(ackLines.join('\n'), threadTs)
+  }
+
   // --- approved Codex outbox dispatch (bd ccsc-81q Phase 1) ---------
 
   // Render a candidate / pending line. Includes the Slack target so
@@ -1512,6 +1829,9 @@ async function main(): Promise<void> {
         break
       case 'codex-review-queue':
         await handleCodexReview(msg, threadTs)
+        break
+      case 'new-project-queue':
+        await handleNewProjectRequest(msg, threadTs)
         break
       case 'dispatch-ok':
         await handleOk(msg, threadTs)
