@@ -7,6 +7,7 @@ import {
   appendConsultContinuationLog,
   buildConsultExecuteAssignment,
   buildConsultFrontmatter,
+  CONSULT_ABORT_ACTIVE_REPLY,
   CONSULT_QUEUE_DIR,
   TO_EXECUTE_DIR,
   classifyConsultSourceChannel,
@@ -250,6 +251,15 @@ describe('buildConsultExecuteAssignment', () => {
     expect(content).toContain('テスト相談')
     expect(content).toContain('## Approved Codex plan')
     expect(content).toContain('## Safety / Hard rules')
+  })
+})
+
+describe('consult reply text helpers', () => {
+  test('CONSULT_ABORT_ACTIVE_REPLY tells Hikaru to cleanup then retry', () => {
+    const text = CONSULT_ABORT_ACTIVE_REPLY('01CONSULT')
+    expect(text).toContain('abort flag active')
+    expect(text).toContain('01CONSULT')
+    expect(text).toContain('[abort cleanup]')
   })
 })
 

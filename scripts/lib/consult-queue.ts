@@ -829,3 +829,6 @@ export const CONSULT_EDIT_ACK = (consultId: string): string =>
 
 export const CONSULT_MISMATCH_PROMPT = (consultId: string, suppliedId: string): string =>
   `consult_id が thread 内 consult と不一致 (= 受信 \`${suppliedId}\` / thread 側 \`${consultId}\`)。\`approve ${consultId}\` で再返信お願いします`
+
+export const CONSULT_ABORT_ACTIVE_REPLY = (consultId: string): string =>
+  `abort flag active のため consult ${consultId} の返信処理を停止しました。[abort cleanup] 後に必要なら同じ thread で再返信してください`

@@ -130,6 +130,7 @@ import {
   appendConsultContinuationLog,
   buildConsultExecuteAssignment,
   buildConsultFrontmatter,
+  CONSULT_ABORT_ACTIVE_REPLY,
   CONSULT_APPROVED_REPLY,
   CONSULT_CANCELLED_REPLY,
   CONSULT_EDIT_ACK,
@@ -2593,6 +2594,11 @@ async function main(): Promise<void> {
     replyThread: string,
   ): Promise<void> {
     const consultId = typeof consult.fm.request_id === 'string' ? consult.fm.request_id : ''
+    if (existsSync(ABORT_FLAG)) {
+      await reply(CONSULT_ABORT_ACTIVE_REPLY(consultId), replyThread)
+      console.log(`[watcher] consult reply skipped: abort flag present request_id=${consultId}`)
+      return
+    }
     const decision = parseHikaruConsultReply(text, consultId)
     switch (decision.kind) {
       case 'approve': {
