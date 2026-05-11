@@ -12,6 +12,7 @@ import {
   interpretAssignment,
   listPendingAssignments,
   recommendedDoneFilename,
+  safeDoneIdForFilename,
   resolveAssignment,
   TO_EXECUTE_DIR,
   TO_EXECUTE_PROCESSED_DIR,
@@ -453,6 +454,16 @@ describe('recommendedDoneFilename', () => {
   test('format: done-<UTC yyyy-mm-ddThhmm>-<done_id>.md', () => {
     const d = new Date(Date.UTC(2026, 4, 12, 1, 15, 0))
     expect(recommendedDoneFilename('ccsc-cw1', d)).toBe('done-2026-05-12T0115-ccsc-cw1.md')
+  })
+
+  test('safeDoneIdForFilename replaces Windows-illegal punctuation', () => {
+    expect(safeDoneIdForFilename('consult:01ABC')).toBe('consult_01ABC')
+    expect(safeDoneIdForFilename('bd-ccsc-cw1')).toBe('bd-ccsc-cw1')
+  })
+
+  test('recommendedDoneFilename sanitizes done_id before embedding in filename', () => {
+    const d = new Date(Date.UTC(2026, 4, 11, 17, 9, 0))
+    expect(recommendedDoneFilename('consult:01ABC', d)).toBe('done-2026-05-11T1709-consult_01ABC.md')
   })
 
   test('uses current time when `now` is omitted', () => {
