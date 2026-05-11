@@ -173,6 +173,71 @@ flip on. The `[abort]` flag-file mechanism itself
 wrapper that touches the same path the DM `[abort]` handler touches,
 then layers the dual notify.
 
+### Project channel registry loader (bd ccsc-a04, Phase 2A)
+
+`scripts/lib/project-channel-registry.ts` exports
+`loadActiveProjectChannels(queueDir)` — a pure function that scans
+the `/new-project` queue dir and returns the list of project
+channels currently considered **active**:
+
+```
+/home/hikaru/projects/hikaru-agent-knowledge/handoff/project-requests/
+```
+
+The loader is the authoritative entry point for "which Slack
+channels does the watcher need to know about?" The queue file
+frontmatter (set by `ccsc-54g` / extended in `ccsc-l34`) is the
+single source of truth — no secondary registry / DB is consulted.
+
+```typescript
+interface ActiveProjectChannel {
+  request_id: string
+  project_channel_id: string         // C... non-empty (guaranteed)
+  project_channel_name: string | null
+  project_channel_status: string | null  // never "archived"|"cancelled"|"failed"
+  created_at: string
+  source_path: string                // debug only
+}
+
+interface RegistryLoadResult {
+  active: ActiveProjectChannel[]
+  malformed_count: number            // parse failure + non-`C...` id
+  duplicate_skip_count: number       // same channel id covered by newer file
+  total_files: number
+}
+```
+
+**Active criteria** (= a queue file appears in `active` iff all hold):
+
+- `project_channel_id` is a non-empty string starting with `C` (=
+  Slack channel id heuristic; `D` / `G` / other prefixes are
+  rejected as malformed). Null / missing / empty is the expected
+  *not-yet-active* state — it is NOT counted as malformed because
+  Phase 1 queue files write `null` until Hikaru creates the
+  channel manually.
+- `project_channel_status` is NOT `archived` / `cancelled` /
+  `failed`. `pending` / `active` / null are all kept (= the id
+  presence is what makes a channel pollable; the status field
+  tracks the Phase 2 brief workflow separately).
+
+**Duplicate handling.** When two queue files share the same
+`project_channel_id`, the one with the latest `created_at` wins;
+others are dropped and counted in `duplicate_skip_count`. Ties on
+`created_at` (= both missing) fall back to alphabetical filename
+order so the result is deterministic across platforms.
+
+**Contracts.** The loader is side-effect-free (no Slack API call,
+no state-file write, no caching across invocations) and never
+throws — failures surface via the numeric counters so the caller
+can log / alert without trying to introspect exceptions.
+
+**Phase 2A only.** This module is loader-only. The watcher polling
+loop does NOT call `loadActiveProjectChannels` yet — Phase 2B
+(multi-channel polling + per-channel `last-ts` persistence) and
+Phase 2C (route wire-up of `routeInboundMessage` into the loop)
+will land in separate bd issues / PRs. Until then this file is
+dead code in production and is exercised only by unit tests.
+
 ### Executor completion relay (bd ccsc-sbf)
 
 Passive-execution Claude sessions cannot post to Slack themselves
