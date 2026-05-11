@@ -54,6 +54,14 @@ export const CONSULT_QUEUE_DIR =
 export const FROM_CODEX_DIR = '/home/hikaru/projects/hikaru-agent-knowledge/handoff/from-codex'
 
 /**
+ * Execution handoff dir. Phase 3 of Mobile Codex Relay writes
+ * approved consult plans here as `type: assign`, matching the
+ * hikaru-agent-knowledge CLAUDE.md rule that executor sessions receive
+ * work through filesystem handoff rather than Slack inbound.
+ */
+export const TO_EXECUTE_DIR = '/home/hikaru/projects/hikaru-agent-knowledge/handoff/to-execute'
+
+/**
  * Reserved-prefix list for the negative-list consult classifier. A DM
  * whose text (lowercased, trimmed) starts with any of these prefixes
  * is NOT a consult — it routes through the existing prefix
@@ -188,6 +196,17 @@ export function consultRequestFilename(createdAt: Date, requestId: string): stri
   const hh = String(createdAt.getUTCHours()).padStart(2, '0')
   const mi = String(createdAt.getUTCMinutes()).padStart(2, '0')
   return `${y}-${m}-${d}T${hh}${mi}-${requestId}.md`
+}
+
+/** Deterministic execute handoff filename for an approved consult. */
+export function consultDispatchFilename(createdAt: Date, consultId: string): string {
+  const y = createdAt.getUTCFullYear()
+  const m = String(createdAt.getUTCMonth() + 1).padStart(2, '0')
+  const d = String(createdAt.getUTCDate()).padStart(2, '0')
+  const hh = String(createdAt.getUTCHours()).padStart(2, '0')
+  const mi = String(createdAt.getUTCMinutes()).padStart(2, '0')
+  const safeId = consultId.replace(/[^A-Za-z0-9_.-]/g, '_')
+  return `${y}-${m}-${d}T${hh}${mi}-consult-dispatch-${safeId}.md`
 }
 
 export interface ConsultFrontmatterArgs {
@@ -372,6 +391,79 @@ export interface CodexPlanEntry {
   status: string
   body: string
   fm: Frontmatter
+}
+
+export interface ConsultExecuteAssignmentArgs {
+  consultId: string
+  createdAt: Date
+  consultCreatedAt: string | null
+  sourceChannel: string | null
+  slackThreadTs: string | null
+  plan: CodexPlanEntry
+  consultBody: string
+}
+
+/** Build the executor handoff content for an approved consult plan. */
+export function buildConsultExecuteAssignment(args: ConsultExecuteAssignmentArgs): string {
+  const risk = args.plan.risk_level ?? 'unspecified'
+  const gate = args.plan.prod_gate ?? 'unspecified'
+  const fm: Frontmatter = {
+    type: 'assign',
+    from: 'Codex',
+    to: '実行担当',
+    created: args.createdAt.toISOString(),
+    correlation_id: `consult-${args.consultId}`,
+    in_reply_to: args.consultId,
+    related_task: `consult:${args.consultId}`,
+    requires_human: 'false',
+    risk_level: risk,
+    dev_verification:
+      typeof args.plan.fm.dev_verification === 'string'
+        ? args.plan.fm.dev_verification
+        : 'conditional',
+    prod_gate: gate,
+    priority: typeof args.plan.fm.priority === 'string' ? args.plan.fm.priority : 'P2',
+    consult_id: args.consultId,
+    codex_plan_ref: args.plan.path,
+    slack_origin_chat_id: args.sourceChannel ?? '',
+    slack_origin_thread_ts: args.slackThreadTs ?? '',
+  }
+  const planBody = args.plan.body.trim() || '(empty plan body)'
+  const consultBody = args.consultBody.trim() || '(empty consult body)'
+  const lines = [
+    '---',
+    serializeFrontmatter(fm),
+    '---',
+    '',
+    `# Approved consult dispatch: ${args.consultId}`,
+    '',
+    '## Goal',
+    "Execute the approved Codex plan generated from Hikaru's Slack consult.",
+    '',
+    '## Context',
+    `- consult_id: ${args.consultId}`,
+    `- consult_created_at: ${args.consultCreatedAt ?? 'unknown'}`,
+    `- plan_id: ${args.plan.plan_id}`,
+    `- risk_level: ${risk}`,
+    `- prod_gate: ${gate}`,
+    '',
+    '## Original consult',
+    consultBody,
+    '',
+    '## Approved Codex plan',
+    planBody,
+    '',
+    '## Safety / Hard rules',
+    '- Honor the risk_level / prod_gate from the plan.',
+    '- Do not touch production data or enable production-facing behavior unless the plan explicitly says the gate allows it.',
+    '- Do not expose secrets, .env values, tokens, or private URLs in logs, PRs, or handoff files.',
+    '- If the plan is ambiguous, blocked, or unsafe, stop and write a blocked result to handoff/from-execute/ instead of guessing.',
+    '',
+    '## Result location',
+    `- Write completion to handoff/from-execute/consult-${args.consultId}-result.md`,
+    '',
+  ]
+  return lines.join('\n')
 }
 
 /**

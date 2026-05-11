@@ -5,9 +5,12 @@ import { join } from 'node:path'
 import {
   analyzeConsultLength,
   appendConsultContinuationLog,
+  buildConsultExecuteAssignment,
   buildConsultFrontmatter,
   CONSULT_QUEUE_DIR,
+  TO_EXECUTE_DIR,
   classifyConsultSourceChannel,
+  consultDispatchFilename,
   consultRequestFilename,
   extractMarkdownBullets,
   findConsultByMessageId,
@@ -190,6 +193,63 @@ describe('consultRequestFilename + CONSULT_QUEUE_DIR', () => {
     expect(CONSULT_QUEUE_DIR).toBe(
       '/home/hikaru/projects/hikaru-agent-knowledge/handoff/codex-consult-queue',
     )
+  })
+
+  test('consultDispatchFilename is deterministic and Windows-safe', () => {
+    const d = new Date(Date.UTC(2026, 4, 11, 14, 55, 0))
+    expect(consultDispatchFilename(d, '01HXY01:BAD/ID')).toBe(
+      '2026-05-11T1455-consult-dispatch-01HXY01_BAD_ID.md',
+    )
+  })
+
+  test('TO_EXECUTE_DIR is a hardcoded absolute path', () => {
+    expect(TO_EXECUTE_DIR).toBe('/home/hikaru/projects/hikaru-agent-knowledge/handoff/to-execute')
+  })
+})
+
+// ---- approved consult → executor handoff ---------------------------
+
+describe('buildConsultExecuteAssignment', () => {
+  test('builds a type=assign handoff with consult + plan context', () => {
+    const content = buildConsultExecuteAssignment({
+      consultId: '01CONSULT',
+      createdAt: new Date('2026-05-12T00:00:00.000Z'),
+      consultCreatedAt: '2026-05-11T15:43:12.483Z',
+      sourceChannel: 'D123',
+      slackThreadTs: '1778514190.616629',
+      consultBody: 'テスト相談',
+      plan: {
+        path: '/home/hikaru/projects/hikaru-agent-knowledge/handoff/from-codex/plan.md',
+        plan_id: 'plan-1',
+        related_consult_id: '01CONSULT',
+        slack_chat_id: 'D123',
+        slack_thread_ts: '1778514190.616629',
+        risk_level: 'low',
+        prod_gate: 'none',
+        status: 'acknowledged',
+        body: '## Files / Repo To Touch\n- none\n\n## Acceptance Criteria\n- green',
+        fm: {
+          type: 'codex-plan',
+          plan_id: 'plan-1',
+          related_consult_id: '01CONSULT',
+          slack_chat_id: 'D123',
+          slack_thread_ts: '1778514190.616629',
+          status: 'acknowledged',
+          dev_verification: 'not-required',
+          priority: 'P3',
+        },
+      },
+    })
+
+    expect(content).toContain('type: "assign"')
+    expect(content).toContain('correlation_id: "consult-01CONSULT"')
+    expect(content).toContain('risk_level: "low"')
+    expect(content).toContain('dev_verification: "not-required"')
+    expect(content).toContain('priority: "P3"')
+    expect(content).toContain('## Original consult')
+    expect(content).toContain('テスト相談')
+    expect(content).toContain('## Approved Codex plan')
+    expect(content).toContain('## Safety / Hard rules')
   })
 })
 

@@ -310,11 +310,44 @@ permissive の status 据置 + confirm prompt は `feedback_no_merge_by_claude.m
 **Phase 1 で実装しない** (= 別 Phase 設計):
 - Codex side の automation polling (= Codex が queue を自動 pick + plan
   起草、Phase 2)
-- `approved` → executor / approved-dispatch outbox への接続 (= Phase 3、
-  本 Phase 1 では `status: approved` の queue file を残すまで)
 - G2 / mobile 短文 UX の復唱 phrase (= Phase 4)
 - project channel 経由の consult (= 本 Phase 1 は DM 限定、`source_channel_type`
   は記録のみ)
+
+### Mobile Codex Relay Phase 3: approved consult → executor handoff
+
+When Hikaru replies imperatively to a planned consult thread (`進めて`,
+`OK 進めて`, or `approve <consult_id>`), the watcher now bridges the
+approved consult to the existing executor filesystem inbox:
+
+```
+handoff/codex-consult-queue/<consult>.md  status: planned
+  + codex_plan_ref -> handoff/from-codex/<plan>.md
+  + Hikaru thread reply "進めて"
+      ↓
+handoff/to-execute/<consult-dispatch>.md  type: assign
+      ↓
+consult queue status: dispatched
+```
+
+The handoff file is written under the hardcoded absolute path:
+
+```
+/home/hikaru/projects/hikaru-agent-knowledge/handoff/to-execute/
+```
+
+This follows the current hikaru-agent-knowledge rule that executor
+sessions receive work through `handoff/to-execute/`, not through Slack
+inbound. The watcher does **not** directly run commands, create PRs,
+merge, or touch production. It only writes a `type: assign` Markdown
+handoff containing the approved plan, original consult, risk metadata,
+and safety rules. If the plan file is missing or malformed, the consult
+is left at `status: approved` and Slack receives a warning instead of a
+silent drop.
+
+`dispatched` is terminal for the consult thread. Duplicate approvals do
+not create duplicate handoff files because the filename is deterministic
+from the consult `created_at` + `request_id`.
 
 `[abort]` flag ON 中は本 Phase 1 の全 subroutine (= consult queue write
 / plan reply sweep / consult reply parse) も停止 (= 既存 flag 尊重)。
