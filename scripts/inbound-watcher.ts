@@ -648,100 +648,32 @@ export function queueFilenameFor(createdAt: Date, parsed: CodexReviewParsed): st
   return `${iso}-${idPart}.md`
 }
 
-// --- frontmatter (exported for testing) -------------------------------
+// --- frontmatter helpers --------------------------------------------
+//
+// Definitions live in `scripts/lib/frontmatter.ts` (extracted per
+// Codex review on PR #10 to break a future cycle with
+// project-channel-registry). Imported here for internal use AND
+// re-exported with the same names so existing importers
+// (`executor-relay.ts`, `outbox.ts`, the test file) keep resolving
+// the same symbols at the same paths — no call-site changes needed
+// in this PR.
 
-export type FrontmatterValue = string | number | null
-export type Frontmatter = Record<string, FrontmatterValue>
+import {
+  escapeYamlString,
+  type Frontmatter,
+  type FrontmatterValue,
+  parseFrontmatterFile,
+  serializeFrontmatter,
+  unescapeYamlString,
+} from './lib/frontmatter'
 
-/**
- * Serialize a flat key/value map to YAML-ish frontmatter (one line per
- * key, double-quoted strings with backslash escapes for `\`, `"`,
- * `\n`, `\r`). Numbers and `null` are emitted bare.
- *
- * Intentionally minimal — the watcher controls both ends, so we don't
- * pull a YAML lib for nested structures we don't use.
- */
-
-/**
- * Escape a string for the double-quoted YAML scalar form we emit.
- * Order matters: backslash MUST be escaped first so the backslash
- * introduced by subsequent escapes (`\"`, `\n`, `\r`) is not
- * re-escaped.
- */
-export function escapeYamlString(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r')
-}
-
-/**
- * Inverse of escapeYamlString. Single-pass to avoid the order trap of
- * a multi-replace pipeline (the prior multi-replace would corrupt a
- * literal `\n` (= backslash + n in the source string) by treating it
- * as an escape after the leading backslash had already been doubled).
- *
- * Recognized escapes: `\\\\` -> `\`, `\\"` -> `"`, `\\n` -> newline,
- * `\\r` -> CR. Unknown escapes (`\\x`) are passed through verbatim
- * (= `\\x` stays `\\x` in the decoded string), so an unrecognized
- * escape never silently loses the leading backslash.
- */
-export function unescapeYamlString(s: string): string {
-  let out = ''
-  let i = 0
-  while (i < s.length) {
-    if (s[i] === '\\' && i + 1 < s.length) {
-      const next = s[i + 1]
-      if (next === '\\') out += '\\'
-      else if (next === '"') out += '"'
-      else if (next === 'n') out += '\n'
-      else if (next === 'r') out += '\r'
-      else out += `\\${next}` // unknown escape: keep verbatim (no silent drop)
-      i += 2
-    } else {
-      out += s[i]
-      i++
-    }
-  }
-  return out
-}
-
-export function serializeFrontmatter(fm: Frontmatter): string {
-  const lines: string[] = []
-  for (const [k, v] of Object.entries(fm)) {
-    if (v === null) {
-      lines.push(`${k}: null`)
-    } else if (typeof v === 'number') {
-      lines.push(`${k}: ${v}`)
-    } else {
-      lines.push(`${k}: "${escapeYamlString(v)}"`)
-    }
-  }
-  return lines.join('\n')
-}
-
-/**
- * Parse a `---\n<frontmatter>\n---\n<body>` file. Mirrors the shape
- * serializeFrontmatter() emits. Unknown YAML constructs (lists, nested
- * maps) are not supported by design.
- */
-export function parseFrontmatterFile(content: string): { fm: Frontmatter; body: string } | null {
-  const m = /^---\n([\s\S]*?)\n---\n?([\s\S]*)$/.exec(content)
-  if (!m) return null
-  const fm: Frontmatter = {}
-  for (const line of m[1].split('\n')) {
-    const lineMatch = /^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$/.exec(line)
-    if (!lineMatch) continue
-    const k = lineMatch[1]
-    const raw = lineMatch[2].trim()
-    if (raw === 'null') {
-      fm[k] = null
-    } else if (/^-?\d+$/.test(raw)) {
-      fm[k] = Number.parseInt(raw, 10)
-    } else if (raw.startsWith('"') && raw.endsWith('"') && raw.length >= 2) {
-      fm[k] = unescapeYamlString(raw.slice(1, -1))
-    } else {
-      fm[k] = raw
-    }
-  }
-  return { fm, body: m[2] ?? '' }
+export {
+  escapeYamlString,
+  type Frontmatter,
+  type FrontmatterValue,
+  parseFrontmatterFile,
+  serializeFrontmatter,
+  unescapeYamlString,
 }
 
 // --- queue file ops (exported for testing, take queueDir param) -------

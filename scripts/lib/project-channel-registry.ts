@@ -36,7 +36,7 @@
 
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseFrontmatterFile } from '../inbound-watcher'
+import { parseFrontmatterFile } from './frontmatter'
 
 /**
  * One entry in the active-channel list. `project_channel_id` is
