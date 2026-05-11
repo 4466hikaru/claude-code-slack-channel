@@ -126,6 +126,31 @@ import {
   pruneRecentlyRelayed,
 } from './executor-relay'
 import {
+  analyzeConsultLength,
+  appendConsultContinuationLog,
+  buildConsultFrontmatter,
+  CONSULT_APPROVED_REPLY,
+  CONSULT_CANCELLED_REPLY,
+  CONSULT_EDIT_ACK,
+  CONSULT_MISMATCH_PROMPT,
+  CONSULT_PERMISSIVE_PROMPT,
+  CONSULT_QUEUE_DIR,
+  classifyConsultSourceChannel,
+  consultRequestFilename,
+  FROM_CODEX_DIR,
+  findConsultByMessageId,
+  findConsultByThreadTs,
+  formatConsultAckReply,
+  formatPlanShortReply,
+  isConsultRequest,
+  listConsultEntries,
+  listReadyCodexPlans,
+  parseHikaruConsultReply,
+  rewriteConsultFrontmatter,
+  routeConsultThreadReply,
+  trackingForConsultPlanReply,
+} from './lib/consult-queue'
+import {
   APPROVE_GRACE_MS,
   extractDraftIdArg,
   filterApproved,
@@ -1422,6 +1447,14 @@ async function main(): Promise<void> {
   // older than DONE_DEDUP_WINDOW_MS on each sweep.
   const recentlyRelayed = new Map<string, number>()
 
+  // Mobile Codex Relay Phase 1 consult-plan reply dedup window (bd
+  // ccsc-nwm). RAM only. Authoritative source of truth that a plan was
+  // relayed is the plan file's `status: acknowledged`; this map covers
+  // the rare race where Slack post succeeded but the file status update
+  // failed. 5-minute window matches the executor-relay convention.
+  const recentlyRelayedConsultPlans = new Map<string, number>()
+  const CONSULT_PLAN_DEDUP_WINDOW_MS = 5 * 60_000
+
   console.log(
     `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs} activeThreads=${activeThreads.size}`,
   )
@@ -2101,7 +2134,19 @@ async function main(): Promise<void> {
     for (const msg of messages) {
       if (typeof msg.text !== 'string' || typeof msg.ts !== 'string') continue
       const trig = detectTrigger(msg.text)
-      if (!trig) continue
+      if (!trig) {
+        // No existing trigger matched — try the consult routing
+        // (bd ccsc-nwm). Sender gate / abort flag / length / token
+        // sanitize are enforced inside handleConsultRequest.
+        try {
+          await handleConsultRequest(msg as SlackMessage)
+        } catch (e) {
+          console.error(
+            `[watcher] consult handler error: ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+        continue
+      }
       // Per-trigger sender gate. [codex-review] uses the resolved
       // codexReviewAllowlist; everything else stays Hikaru-only.
       if (
@@ -2184,6 +2229,71 @@ async function main(): Promise<void> {
         if (!shouldProcessThreadMessage(msg, threadTs, newest)) continue
         const text = msg.text as string
         const ts = msg.ts as string
+
+        // Mobile Codex Relay Phase 1 (bd ccsc-nwm): when the thread
+        // has an active consult queue entry, route Hikaru replies
+        // based on the consult's status. Codex review #11 fix 2:
+        // status='pending' MUST also be captured here (= sanitize +
+        // append to continuation log) so additional explanations from
+        // Hikaru between consult ack and Codex plan ack are not lost.
+        //   - pending → continuation (= append + sanitize, no parser)
+        //   - planned → parser (= approve/abort/permissive/edit)
+        //   - terminal/blocked/unknown → ignore (= fall through to the
+        //     existing thread-reply trigger dispatch)
+        const activeConsult = findConsultByThreadTs(CONSULT_QUEUE_DIR, threadTs, {
+          wantActiveOnly: true,
+        })
+        const consultRoute = routeConsultThreadReply(activeConsult)
+        if (consultRoute.kind !== 'ignore') {
+          if (msg.user !== config.hikaruUserId) {
+            newest = ts
+            continue
+          }
+          if (consultRoute.kind === 'continuation' && activeConsult) {
+            // Pending continuation: sanitize body and append to the
+            // consult's continuation log. No Slack reply (= Codex sees
+            // the updated body on next pick). status remains 'pending'.
+            try {
+              const { body: cleanText } = sanitizeTokens(text)
+              appendConsultContinuationLog(activeConsult.path, {
+                text: cleanText,
+                slackMessageId: ts,
+                slackTs: ts,
+              })
+              const rid =
+                typeof activeConsult.fm.request_id === 'string' ? activeConsult.fm.request_id : '?'
+              console.log(
+                `[watcher] consult pending-continuation appended request_id=${rid} ts=${ts}`,
+              )
+            } catch (e) {
+              console.error(
+                `[watcher] consult pending-continuation log failed thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
+              )
+            }
+            newest = ts
+            mutated = true
+            continue
+          }
+          // consultRoute.kind === 'parse' → planned consult
+          if (consultRoute.kind === 'parse' && activeConsult) {
+            try {
+              await applyConsultReplyDecision(
+                { path: activeConsult.path, fm: activeConsult.fm },
+                text,
+                ts,
+                threadTs,
+              )
+            } catch (e) {
+              console.error(
+                `[watcher] consult reply handler error thread=${threadTs}: ${e instanceof Error ? e.message : String(e)}`,
+              )
+            }
+            newest = ts
+            mutated = true
+            continue
+          }
+        }
+
         const trig = detectTrigger(text)
         if (!trig) {
           // Non-trigger message in the thread — advance cursor so we
@@ -2333,6 +2443,323 @@ async function main(): Promise<void> {
     }
   }
 
+  // --- Mobile Codex Relay Phase 1 (bd ccsc-nwm) -------------------
+
+  /**
+   * Handle a Slack DM message that did NOT match any existing trigger
+   * prefix and looks like a natural-language consult request.
+   *
+   * Decision flow:
+   *  1. `[abort]` flag present → silent skip
+   *  2. sender must be Hikaru
+   *  3. `isConsultRequest` true (= no reserved prefix, not a bare token)
+   *  4. `analyzeConsultLength` ≠ 'ignore' (= ≥ 5 chars after trim)
+   *  5. idempotent by `message_id` (= already queued → no-op)
+   *  6. continuation by `thread_ts` (= active consult on same thread →
+   *     append continuation log, no new file, no ack reply)
+   *  7. otherwise: mkdir + atomic write of new queue file + ack reply
+   *
+   * Body sanitization (= `sanitizeTokens`) is applied before any
+   * filesystem write so raw secrets never reach the queue file or
+   * the Slack ack.
+   */
+  async function handleConsultRequest(msg: SlackMessage): Promise<void> {
+    if (existsSync(ABORT_FLAG)) {
+      console.log('[watcher] consult skipped: abort flag present')
+      return
+    }
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const ts = typeof msg.ts === 'string' ? msg.ts : ''
+    const userId = typeof msg.user === 'string' ? msg.user : ''
+    if (userId !== config.hikaruUserId) return
+    if (!isConsultRequest(text)) return
+
+    const lengthKind = analyzeConsultLength(text)
+    if (lengthKind === 'ignore') {
+      console.log(`[watcher] consult ignored (short): ts=${ts}`)
+      return
+    }
+
+    // Idempotency: same message_id already queued?
+    const existingByMsg = findConsultByMessageId(CONSULT_QUEUE_DIR, ts)
+    if (existingByMsg) {
+      console.log(`[watcher] consult idempotent no-op message_id=${ts}`)
+      return
+    }
+
+    try {
+      mkdirSync(CONSULT_QUEUE_DIR, { recursive: true })
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e)
+      console.error(`[watcher] consult mkdir failed: ${m}`)
+      try {
+        const threadTsForErr = (msg.thread_ts as string | undefined) ?? ts
+        await reply(`[consult] queue dir 作成失敗: ${m}`, threadTsForErr)
+      } catch {
+        // best effort
+      }
+      return
+    }
+
+    const threadTs = (msg.thread_ts as string | undefined) ?? ts
+    const { body: bodyClean, redactedNames } = sanitizeTokens(text)
+
+    const activeConsult = findConsultByThreadTs(CONSULT_QUEUE_DIR, threadTs, {
+      wantActiveOnly: true,
+    })
+    if (activeConsult) {
+      // Continuation utterance — append to log, do not create new file
+      // or send a new ack (= Codex sees the updated body on next pick).
+      try {
+        appendConsultContinuationLog(activeConsult.path, {
+          text: bodyClean,
+          slackMessageId: ts,
+          slackTs: ts,
+        })
+        const reqId =
+          typeof activeConsult.fm.request_id === 'string' ? activeConsult.fm.request_id : '?'
+        console.log(`[watcher] consult continuation appended request_id=${reqId} ts=${ts}`)
+      } catch (e) {
+        console.error(
+          `[watcher] consult continuation log failed: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      return
+    }
+
+    const createdAt = new Date()
+    const requestId = generateUlid(createdAt.getTime())
+    const fm = buildConsultFrontmatter({
+      requestId,
+      createdAt,
+      sourceChannel: config.hikaruDmChannel,
+      sender: 'hikaru',
+      slackMessageId: ts,
+      slackThreadTs: threadTs,
+      riskGuess: lengthKind === 'ambiguous' ? 'ambiguous' : null,
+    })
+    const path = join(CONSULT_QUEUE_DIR, consultRequestFilename(createdAt, requestId))
+    const content = `---\n${serializeFrontmatter(fm)}\n---\n${bodyClean}\n\n## continuation log\n`
+    const tmpPath = `${path}.tmp.${process.pid}`
+    try {
+      writeFileSync(tmpPath, content)
+      renameSync(tmpPath, path)
+    } catch (e) {
+      try {
+        unlinkSync(tmpPath)
+      } catch {
+        // tmp may not exist; best effort cleanup
+      }
+      const m = e instanceof Error ? e.message : String(e)
+      console.error(`[watcher] consult write failed: ${m}`)
+      try {
+        await reply(`[consult] queue 起票 NG (bridge log 確認要): ${m}`, threadTs)
+      } catch {
+        // best effort
+      }
+      return
+    }
+
+    const ack = formatConsultAckReply({
+      requestId,
+      riskGuess: lengthKind === 'ambiguous' ? 'ambiguous' : null,
+      sourceChannelType: classifyConsultSourceChannel(config.hikaruDmChannel),
+      redactedNames,
+    })
+    await reply(ack, threadTs)
+    console.log(
+      `[watcher] consult queued request_id=${requestId} length_kind=${lengthKind} -> ${path}`,
+    )
+  }
+
+  /**
+   * Apply a `parseHikaruConsultReply` decision against an active
+   * planned consult queue entry. Mutates the queue file's status /
+   * frontmatter as appropriate and posts a short reply in the same
+   * thread. `replyThread` is the thread ts the watcher should post
+   * into (= the consult thread root).
+   */
+  async function applyConsultReplyDecision(
+    consult: {
+      path: string
+      fm: Frontmatter
+    },
+    text: string,
+    msgTs: string,
+    replyThread: string,
+  ): Promise<void> {
+    const consultId = typeof consult.fm.request_id === 'string' ? consult.fm.request_id : ''
+    const decision = parseHikaruConsultReply(text, consultId)
+    switch (decision.kind) {
+      case 'approve': {
+        const next: Frontmatter = {
+          ...consult.fm,
+          status: 'approved',
+          hikaru_response: 'ok',
+        }
+        rewriteConsultFrontmatter(consult.path, next)
+        await reply(CONSULT_APPROVED_REPLY(consultId), replyThread)
+        console.log(`[watcher] consult approved request_id=${consultId}`)
+        return
+      }
+      case 'abort': {
+        const next: Frontmatter = {
+          ...consult.fm,
+          status: 'cancelled',
+          hikaru_response: 'abort',
+        }
+        rewriteConsultFrontmatter(consult.path, next)
+        await reply(CONSULT_CANCELLED_REPLY(consultId), replyThread)
+        console.log(`[watcher] consult cancelled request_id=${consultId}`)
+        return
+      }
+      case 'permissive': {
+        await reply(CONSULT_PERMISSIVE_PROMPT(consultId), replyThread)
+        console.log(`[watcher] consult permissive prompt request_id=${consultId}`)
+        return
+      }
+      case 'mismatch': {
+        await reply(CONSULT_MISMATCH_PROMPT(consultId, decision.suppliedId), replyThread)
+        console.log(
+          `[watcher] consult mismatch supplied=${decision.suppliedId} expected=${consultId}`,
+        )
+        return
+      }
+      case 'edit': {
+        const { body: cleanText, redactedNames } = sanitizeTokens(decision.text)
+        appendConsultContinuationLog(consult.path, {
+          text: cleanText,
+          slackMessageId: msgTs,
+          slackTs: msgTs,
+        })
+        const next: Frontmatter = {
+          ...consult.fm,
+          status: 'pending',
+        }
+        rewriteConsultFrontmatter(consult.path, next)
+        let ack = CONSULT_EDIT_ACK(consultId)
+        if (redactedNames.length > 0) {
+          ack += `\n  ⚠ token-like 検出 (${redactedNames.join(',')})、sanitize 済`
+        }
+        await reply(ack, replyThread)
+        console.log(`[watcher] consult edit request_id=${consultId}`)
+        return
+      }
+      case 'none':
+        // No action — too short / empty fragment.
+        return
+    }
+  }
+
+  /**
+   * Sweep `handoff/from-codex/*.md` for `type: codex-plan` + `status:
+   * ready` plan files and post a short Slack reply into the consult
+   * thread. Updates plan file → `acknowledged` and consult queue →
+   * `planned`. Idempotent via the 5-min recentlyRelayedConsultPlans
+   * window.
+   *
+   * Coexists with the approved-dispatch outbox (= same dir) — outbox
+   * drafts are skipped because they lack `type: codex-plan`. The
+   * existing `dispatchSweep()` similarly skips plan files because they
+   * lack `draft_id`.
+   */
+  async function consultPlanReplySweep(): Promise<void> {
+    if (existsSync(ABORT_FLAG)) return
+    const now = Date.now()
+    for (const [planId, relayedAt] of recentlyRelayedConsultPlans.entries()) {
+      if (now - relayedAt >= CONSULT_PLAN_DEDUP_WINDOW_MS) {
+        recentlyRelayedConsultPlans.delete(planId)
+      }
+    }
+    const plans = listReadyCodexPlans(FROM_CODEX_DIR)
+    if (plans.length === 0) return
+
+    // Index consult queue once per sweep to find related entries.
+    const consultEntries = listConsultEntries(CONSULT_QUEUE_DIR)
+    const consultByRequestId = new Map<string, { path: string; fm: Frontmatter }>()
+    for (const e of consultEntries) {
+      const rid = typeof e.fm.request_id === 'string' ? e.fm.request_id : ''
+      if (rid.length > 0) consultByRequestId.set(rid, { path: e.path, fm: e.fm })
+    }
+
+    for (const plan of plans) {
+      if (recentlyRelayedConsultPlans.has(plan.plan_id)) continue
+      const consult = consultByRequestId.get(plan.related_consult_id)
+      if (!consult) {
+        console.warn(
+          `[watcher] consult plan skipped: related_consult_id=${plan.related_consult_id} not found (will retry next sweep)`,
+        )
+        continue
+      }
+      const { text: replyText, redactedNames } = formatPlanShortReply({
+        plan,
+        consultId: plan.related_consult_id,
+        sanitize: sanitizeTokens,
+      })
+      try {
+        await slack.chat.postMessage({
+          channel: plan.slack_chat_id,
+          text: replyText,
+          thread_ts: plan.slack_thread_ts,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      } catch (e) {
+        console.error(
+          `[watcher] consult plan post failed plan_id=${plan.plan_id}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+        continue
+      }
+      try {
+        rewriteConsultFrontmatter(plan.path, { ...plan.fm, status: 'acknowledged' })
+      } catch (e) {
+        console.error(
+          `[watcher] plan file status update failed plan_id=${plan.plan_id}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      try {
+        rewriteConsultFrontmatter(consult.path, {
+          ...consult.fm,
+          status: 'planned',
+          codex_plan_ref: plan.path,
+        })
+      } catch (e) {
+        console.error(
+          `[watcher] consult queue status update failed request_id=${plan.related_consult_id}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      recentlyRelayedConsultPlans.set(plan.plan_id, Date.now())
+
+      // Codex review #11 fix 1: register the consult thread with the
+      // active-thread tracker so `pollThreadReplies` keeps fetching
+      // `conversations.replies` on it. Without this, Hikaru's
+      // imperative reply to a plan posted > 15 min after the consult
+      // ack would never reach `applyConsultReplyDecision`. The
+      // `reply()` helper already does this for posts that target
+      // `config.hikaruDmChannel`; consultPlanReplySweep posts to the
+      // consult's source channel directly so the recording must
+      // happen here.
+      const tracking = trackingForConsultPlanReply({
+        slack_thread_ts: plan.slack_thread_ts,
+      })
+      if (tracking.track) {
+        recordThreadReply(activeThreads, tracking.threadTs, Date.now())
+        try {
+          saveActiveThreads(ACTIVE_THREADS_FILE, activeThreads)
+        } catch (e) {
+          console.error(
+            `[watcher] saveActiveThreads error (consult plan tracking): ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+      }
+
+      const note = redactedNames.length > 0 ? ` (sanitized: ${redactedNames.join(',')})` : ''
+      console.log(
+        `[watcher] consult plan relayed plan_id=${plan.plan_id} consult=${plan.related_consult_id} thread=${plan.slack_thread_ts}${note}`,
+      )
+    }
+  }
+
   let stop = false
   process.on('SIGINT', () => {
     stop = true
@@ -2364,6 +2791,13 @@ async function main(): Promise<void> {
     } catch (e) {
       console.error(
         `[watcher] executor relay sweep error: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
+    try {
+      await consultPlanReplySweep()
+    } catch (e) {
+      console.error(
+        `[watcher] consult plan reply sweep error: ${e instanceof Error ? e.message : String(e)}`,
       )
     }
     if (stop) break

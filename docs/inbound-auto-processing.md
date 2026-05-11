@@ -261,6 +261,64 @@ same dir (`result` / `propose` / `progress` / `ask` for the
 consultation coordinator) are not touched by this relay. Token guard
 runs on `summary + body` before relay; raw secret hits log + skip.
 
+### Mobile Codex Relay Phase 1 (bd ccsc-nwm)
+
+Hikaru がスマホ / G2 / Slack DM から自然文で投げた相談を、コピペなしで
+Codex に届けるための watcher 拡張。3 stream の delta:
+
+**A. DM 自然文 → consult queue write.** 既存 reserved prefix (= `status?`
+/ `prs?` / `pending?` / `[abort*]` / `[tech]` ... / `[新規]` / `[実行]` /
+`[codex-review]` / `approve <id>` / `cancel <id>` 等) と match しない、
+かつ bare token (= `OK`、`approve` 単独 等) でもない DM は `consult-
+request` と判定。5+ char で `handoff/codex-consult-queue/<id>.md` に flat
+YAML frontmatter で起票。短文 (5-14 char) は `risk_guess: ambiguous` を
+立てる、空 / 1-4 char は ignore。
+
+同 thread (= `slack_thread_ts` 一致) に **active な** consult queue
+file (= `status: pending` または `planned`) があれば、新規 file は作らず
+継続発話として `## continuation log` セクションに追記する (= terminal
+status のときだけ新規起票)。idempotency は `slack_message_id` 一致で
+no-op。token 検出時は body を `[REDACTED:...]` に置換し ack に名前のみ
+通知 (= raw 値は queue file / Slack / log のいずれにも残さない)。
+
+**B. `handoff/from-codex/` polling → Slack thread reply.** Codex が手動
+で書く `type: codex-plan` + `status: ready` の plan file を polling tick
+で scan、approved-dispatch outbox draft (= `draft_id` 持ち) とは
+`type: codex-plan` で区別。short format (= 500-1000 char、3 ブロック)
+を組み立てて `slack_chat_id` + `slack_thread_ts` 同 thread に reply、
+post 成功で plan file `status: acknowledged` + 紐づく consult queue
+`status: planned` + `codex_plan_ref` 同期更新。post 失敗時は file 不変
+で次 sweep retry、5-min sliding window で plan_id dedup。
+
+**C. Hikaru thread reply parse.** consult queue が `planned` な thread
+への Hikaru thread reply は consult reply parser で解釈:
+
+| 入力 | 結果 | reply |
+|---|---|---|
+| `approve <consult_id>` (= exact match) | `status: approved` | `✅ approved` |
+| 自然文 imperative (= `進めて` / `OK 進めて` / `やってください` / `実行して`) | 同上 | 同上 |
+| `abort <consult_id>` / `やめて` / `中止` / `cancel` (bare) | `status: cancelled` | `❌ cancelled` |
+| permissive (= bare `OK` / `approve してよい` / `任せる`) | **status 変更せず** | confirm prompt (= imperative directive を要求) |
+| consult_id mismatch (= `approve OTHER`) | status 変更せず | 「`approve <thread の consult_id>` で再返信」 |
+| 自然文 (= 5+ char、上記いずれにも match しない) | `continuation log` 追記 + `status: pending` に戻す | 「修正受領、Codex に再起草要請」 |
+| 空 / 4 char 以下 fragment | none (= 無視) | (なし) |
+
+permissive の status 据置 + confirm prompt は `feedback_no_merge_by_claude.md`
+の "imperative directive 必須" ルールを Phase 1 で適用したもの。bare `OK`
+で勝手に approved に進めない。
+
+**Phase 1 で実装しない** (= 別 Phase 設計):
+- Codex side の automation polling (= Codex が queue を自動 pick + plan
+  起草、Phase 2)
+- `approved` → executor / approved-dispatch outbox への接続 (= Phase 3、
+  本 Phase 1 では `status: approved` の queue file を残すまで)
+- G2 / mobile 短文 UX の復唱 phrase (= Phase 4)
+- project channel 経由の consult (= 本 Phase 1 は DM 限定、`source_channel_type`
+  は記録のみ)
+
+`[abort]` flag ON 中は本 Phase 1 の全 subroutine (= consult queue write
+/ plan reply sweep / consult reply parse) も停止 (= 既存 flag 尊重)。
+
 ### Thread-reply polling (bd ccsc-v5m)
 
 `conversations.history` only returns top-level DM messages, so a
