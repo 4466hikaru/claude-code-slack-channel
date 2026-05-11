@@ -115,6 +115,16 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { WebClient } from '@slack/web-api'
 import {
+  archiveDoneFile,
+  detectTokenInDoneEntry,
+  EXECUTOR_DONE_DIR,
+  formatDoneNotification,
+  isRecentlyRelayed,
+  listDoneEntries,
+  listMalformedDoneFiles,
+  pruneRecentlyRelayed,
+} from './executor-relay'
+import {
   APPROVE_GRACE_MS,
   extractDraftIdArg,
   filterApproved,
@@ -961,6 +971,14 @@ async function main(): Promise<void> {
   const activeThreads: ActiveThreadMap = loadActiveThreads(ACTIVE_THREADS_FILE)
   pruneStaleThreads(activeThreads, Date.now())
 
+  // Executor completion relay dedup window (bd ccsc-sbf). RAM only —
+  // the authoritative source of truth that a done file has been relayed
+  // is the file's location (= once moved into `processed/`, it is no
+  // longer listed by `listDoneEntries`). This map covers the rare race
+  // where Slack post succeeded but archive failed; it expires entries
+  // older than DONE_DEDUP_WINDOW_MS on each sweep.
+  const recentlyRelayed = new Map<string, number>()
+
   console.log(
     `[watcher] starting; channel=${config.hikaruDmChannel} sender=${config.hikaruUserId} codexAllow=[${codexReviewAllowlist.join(',')}] pollMs=${pollIntervalMs} lastTs=${lastTs} activeThreads=${activeThreads.size}`,
   )
@@ -1670,6 +1688,96 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * Executor completion relay sweep (bd ccsc-sbf).
+   *
+   * Passive-execution sessions cannot post to Slack themselves. They
+   * drop `done-*.md` files into EXECUTOR_DONE_DIR with a flat YAML
+   * frontmatter (`type: done`, `done_id`, `status`, `summary`, plus
+   * optional `related_bd` / `related_pr` / `executor_session` /
+   * `needs_review`). This sweep:
+   *
+   * 1. Lists parseable done entries (= filename matches `done-*.md` AND
+   *    frontmatter type is `done` AND required fields are present).
+   * 2. For each entry, skips it if its `done_id` was relayed within the
+   *    past 5 minutes (= advisory window covering the rare race where
+   *    Slack post succeeded but archive failed).
+   * 3. Token guard: if the summary or body contains a raw secret
+   *    pattern, refuses to relay (= log only; file remains so the
+   *    executor can inspect and re-write).
+   * 4. Posts `✅ 実行役完了: <summary>` (+ status / done_id / optional
+   *    bd / PR / `[review 待ち]`) to Hikaru's main DM (= NOT in a
+   *    thread). On `chat.postMessage` success: `archiveDoneFile()`
+   *    atomically moves the file into `processed/` and the done_id is
+   *    recorded in the dedup map. On failure: file remains, no map
+   *    entry, archive deferred to the next sweep.
+   *
+   * Malformed done files (= named `done-*.md` but failing interpret)
+   * are logged once per sweep and left in place; the executor inspects
+   * and re-writes. Other types (`result` / `propose` / `progress` /
+   * `ask`) live in the same directory and MUST NOT be touched here —
+   * those belong to the consultation coordinator path.
+   */
+  async function executorRelaySweep(): Promise<void> {
+    const now = Date.now()
+    const pruned = pruneRecentlyRelayed(recentlyRelayed, now)
+    if (pruned.length > 0) {
+      console.log(`[watcher] executor-relay pruned dedup: ${pruned.join(',')}`)
+    }
+
+    const malformed = listMalformedDoneFiles(EXECUTOR_DONE_DIR)
+    for (const path of malformed) {
+      console.error(`[watcher] executor-relay malformed done file (left in place): ${path}`)
+    }
+
+    const entries = listDoneEntries(EXECUTOR_DONE_DIR)
+    for (const entry of entries) {
+      if (isRecentlyRelayed(recentlyRelayed, entry.done_id, now)) {
+        console.log(`[watcher] executor-relay skip (recently relayed): done_id=${entry.done_id}`)
+        continue
+      }
+      const token = detectTokenInDoneEntry(entry)
+      if (token !== null) {
+        console.error(
+          `[watcher] executor-relay token guard (${token}) — refusing to relay: done_id=${entry.done_id} path=${entry.path}`,
+        )
+        continue
+      }
+      const text = formatDoneNotification(entry)
+      try {
+        await slack.chat.postMessage({
+          channel: config.hikaruDmChannel,
+          text,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      } catch (e) {
+        console.error(
+          `[watcher] executor-relay chat.postMessage error (file left in place) done_id=${entry.done_id}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+        continue
+      }
+      try {
+        const dest = archiveDoneFile(entry.path)
+        recentlyRelayed.set(entry.done_id, Date.now())
+        console.log(
+          `[watcher] executor-relay relayed done_id=${entry.done_id} status=${entry.status} -> ${dest}`,
+        )
+      } catch (e) {
+        // Slack post succeeded; archive failed. Mark dedup so the next
+        // sweep does not double-post within the window. The file
+        // remains in EXECUTOR_DONE_DIR — operator must move it
+        // manually or let the next archive attempt succeed (which it
+        // won't, since the file is still in place; but the dedup
+        // window prevents re-notify until it expires).
+        recentlyRelayed.set(entry.done_id, Date.now())
+        console.error(
+          `[watcher] executor-relay archive error (file remains, dedup recorded) done_id=${entry.done_id}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+    }
+  }
+
   let stop = false
   process.on('SIGINT', () => {
     stop = true
@@ -1694,6 +1802,13 @@ async function main(): Promise<void> {
     } catch (e) {
       console.error(
         `[watcher] thread reply sweep error: ${e instanceof Error ? e.message : String(e)}`,
+      )
+    }
+    try {
+      await executorRelaySweep()
+    } catch (e) {
+      console.error(
+        `[watcher] executor relay sweep error: ${e instanceof Error ? e.message : String(e)}`,
       )
     }
     if (stop) break
