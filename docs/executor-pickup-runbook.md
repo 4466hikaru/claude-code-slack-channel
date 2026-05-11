@@ -34,6 +34,12 @@ bun scripts/pickup-to-execute.ts show <id-or-filename>
 
 # atomically claim — moves file to processed/ and prints the body
 bun scripts/pickup-to-execute.ts claim <id-or-filename>
+
+# wait until one assignment appears, claim one, then exit
+bun scripts/pickup-to-execute.ts wait --poll-ms 5000
+
+# smoke: check once without waiting
+bun scripts/pickup-to-execute.ts wait --timeout-ms 0
 ```
 
 `<id-or-filename>` accepts any of:
@@ -45,6 +51,32 @@ bun scripts/pickup-to-execute.ts claim <id-or-filename>
 
 Ambiguous substrings print the candidate list to stderr and exit
 non-zero — narrow the input before retrying.
+
+## Wait mode
+
+Use wait mode when an execution-role session should block until the
+next assignment arrives instead of asking Hikaru to tell it when to run
+list again:
+
+```bash
+bun scripts/pickup-to-execute.ts wait --poll-ms 5000
+```
+
+wait checks the abort flag on every poll. When the first valid
+assignment appears, it atomically claims that single assignment, prints
+the same body and done-file guidance as claim, then exits. It does not
+loop forever after claiming, and it never executes the assignment body.
+
+Useful options:
+
+- --poll-ms <ms>: polling cadence, allowed range 1000-60000, default 5000
+- --timeout-ms <ms>: stop waiting after this long; 0 means one immediate check
+
+Example smoke check:
+
+```bash
+bun scripts/pickup-to-execute.ts wait --timeout-ms 0
+```
 
 ## Lifecycle of one assignment
 
@@ -107,8 +139,8 @@ all subroutines resume on the next watcher tick.
 - ✅ redact token-like assignment body content from stdout; if this happens, inspect the claimed file carefully and report a blocker without exposing the secret
 - ❌ delete the assignment file (= moves to `processed/` only)
 - ❌ make GitHub API calls (= no PR creation, no merge)
-- ❌ run a polling loop / persistent daemon (= one-shot CLI; the
-  executor session decides cadence)
+- ✅ wait for the next assignment and claim one file when the executor explicitly runs wait
+- ❌ run as a persistent daemon after claim (= wait exits after claiming one assignment)
 
 If the assignment body asks for something this CLI doesn't do, the
 executor session performs it as a separate, audited step.
@@ -152,8 +184,7 @@ path is touched.
 
 ## Future work (out of scope for Phase 1)
 
-- automatic polling loop (= a long-running watcher equivalent for
-  the executor side)
+- long-running daemon / service wrapper around wait mode
 - multi-executor coordination (= explicit "claimed by <session>"
   marker instead of relying on `renameSync` race semantics)
 - automatic re-queue when a claim has been in `processed/` for a
