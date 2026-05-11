@@ -34,6 +34,29 @@ The watcher does **not** implement Block Kit confirmations or
 multi-step approval; bare `OK` requires three independent conditions
 (unique pending + TTL + thread match) to gate the action.
 
+### Executor completion relay (bd ccsc-sbf)
+
+Passive-execution Claude sessions cannot post to Slack themselves
+(no MCP `reply`, no bridge ownership). They drop a `done-*.md` file
+into
+
+```
+/home/hikaru/projects/hikaru-agent-knowledge/handoff/from-execute/
+```
+
+with a flat YAML frontmatter — `type: done`, `done_id`,
+`status: complete|blocked|failed`, `summary`, and optional
+`related_bd` / `related_pr` / `executor_session` / `needs_review` —
+and the watcher relays the body to Hikaru's main DM as
+`✅ 実行役完了: <summary>` on the next sweep, then atomically moves
+the file into `handoff/from-execute/processed/`. The dedup key is
+`done_id` (5-minute sliding window covers the rare race where Slack
+post succeeded but archive failed). Files matching `done-*.md` but
+failing interpret are logged and left in place. Other types in the
+same dir (`result` / `propose` / `progress` / `ask` for the
+consultation coordinator) are not touched by this relay. Token guard
+runs on `summary + body` before relay; raw secret hits log + skip.
+
 ### Thread-reply polling (bd ccsc-v5m)
 
 `conversations.history` only returns top-level DM messages, so a
