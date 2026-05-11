@@ -124,16 +124,34 @@ without these 7 fields parse without error, and the channel handlers
 only read what they need.
 
 **B. Project-channel inbound routing.** The dispatch layer learns
-five mutually-exclusive routing decisions, returned by the pure
-helper `routeInboundMessage(text, chatId)`:
+six mutually-exclusive routing decisions, returned by the pure
+helper `routeInboundMessage(text, chatId)`. Decisions are evaluated
+**in this priority order** so the emergency `[abort]` signal cannot
+be silently dropped on an unrecognized channel:
+
+1. `dm-passthrough` (DM)
+2. `channel-abort` (= **ANY non-DM** with `[abort]`)
+3. `unknown-channel-noop` (= `G...` / empty / malformed AND not `[abort]`)
+4. `channel-warn` / `channel-passthrough` / `channel-noop` (= `C...` only)
 
 | decision | trigger | action |
 |---|---|---|
 | `dm-passthrough` | `chat_id` is DM | existing dispatch path (regression-free) |
-| `channel-abort` | non-DM + `[abort]` (exact, case-insensitive) | touch `handoff/abort-lv2` + reply in channel + dual-notify Hikaru's DM |
-| `channel-warn` | non-DM + non-emergency ops prefix (13 listed) | 1-line warning, redirect user to DM, log; no handler/subagent fires |
-| `channel-passthrough` | non-DM + post-through verb (`approve` / `approve-impl` / `cancel` / `cancel-impl` / `OK`) | silent — consultation session reads via MCP |
-| `channel-noop` / `unknown-channel-noop` | non-DM + anything else, or `G...`/empty/malformed chat_id | silent + log at dispatch layer |
+| `channel-abort` | **any non-DM** chat_id (`C...` / `G...` / empty / malformed) + `[abort]` (exact, case-insensitive) | touch `handoff/abort-lv2` + reply in channel (when replyable) + dual-notify Hikaru's DM |
+| `channel-warn` | `chat_id` is `C...` (project-channel) + non-emergency ops prefix (13 listed) | 1-line warning, redirect user to DM, log; no handler/subagent fires |
+| `channel-passthrough` | `chat_id` is `C...` + post-through verb (`approve` / `approve-impl` / `cancel` / `cancel-impl` / `OK`) | silent — consultation session reads via MCP |
+| `channel-noop` | `chat_id` is `C...` + anything else | silent (no watcher action) |
+| `unknown-channel-noop` | `chat_id` is `G...` / empty / malformed **AND** text is NOT `[abort]` | silent + log at dispatch layer |
+
+Why the priority pin: an operator typing `[abort]` from an
+unrecognized channel (group DM, malformed id, etc.) must still
+trigger the global stop. The DM leg of the dual notify is
+unconditional (we own that channel) so Hikaru sees the event even
+when the source channel is not replyable — but `handoff/abort-lv2`
+gets touched in any case. Codex review on PR #9 flagged the earlier
+ordering (`unknown-channel-noop` before `[abort]`) as a merge
+blocker for exactly this reason; the corrected priority is pinned by
+unit tests so it cannot regress.
 
 The non-emergency ops set covers:
 `[abort-test]` / `[abort cleanup]` / `[codex-review]` /
@@ -141,8 +159,11 @@ The non-emergency ops set covers:
 `[marketing]` / `[ops]` / `[brainstorm]` /
 `status?` / `prs?` / `pending?`. `[abort-test]` and
 `[abort cleanup]` stay DM-only by design (= safer to make the user
-acknowledge they're in the right context) — they fall into the
-`channel-warn` bucket.
+acknowledge they're in the right context). On a `C...` channel they
+fall into `channel-warn`; on a `G...`/malformed channel they fall to
+`unknown-channel-noop` (silent) since the `[abort]` exception only
+matches the exact `[abort]` prefix, not the longer `[abort-*]` /
+`[abort cleanup]` siblings.
 
 Phase 1 production polling stays DM-only, so every real-world call
 returns `dm-passthrough` today. The channel-handler code is exercised
