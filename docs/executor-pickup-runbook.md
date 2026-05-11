@@ -67,6 +67,27 @@ assignment appears, it atomically claims that single assignment, prints
 the same body and done-file guidance as claim, then exits. It does not
 loop forever after claiming, and it never executes the assignment body.
 
+## Execution-role operating loop
+
+For an execution-role Claude session, the steady-state loop is:
+
+1. Start from `/home/hikaru/projects/claude-code-slack-channel`.
+2. Run `bun scripts/pickup-to-execute.ts wait --poll-ms 5000`.
+3. When `wait` claims an assignment, read the printed body and perform exactly that assignment.
+4. Write the required `handoff/from-execute/done-*.md` result file.
+5. After the done file is written and no blocker remains, return to step 2.
+
+The execution-role session should not sit idle after a successful done file. If there is no current assignment, its normal resting state is blocked inside `wait --poll-ms 5000`.
+
+Stop conditions:
+
+- `handoff/abort-lv2` exists: stop immediately; wait exits with code 2.
+- The assignment is ambiguous, unsafe, or outside scope: write a `done-*.md` with `status: "blocked"` and do not continue guessing.
+- Local git state is unexpectedly dirty in files the assignment needs: report blocked before editing.
+- A command needs prod, secrets, DB, Vercel, or external write access that the assignment did not explicitly authorize: stop and report blocked.
+
+This loop is operational guidance, not an auto-executor. The CLI only claims and prints one assignment; Claude still reasons through the task and writes the done file deliberately.
+
 Useful options:
 
 - --poll-ms <ms>: polling cadence, allowed range 1000-60000, default 5000
