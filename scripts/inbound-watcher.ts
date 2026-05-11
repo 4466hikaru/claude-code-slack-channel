@@ -1120,22 +1120,33 @@ function detectPassthroughVerb(text: string): string | null {
  *
  * - `dm-passthrough`: chat_id is `D...` → existing dispatch path
  *   handles it (unchanged behavior, regression-free).
- * - `channel-abort`: chat_id is non-DM AND text starts with the
- *   emergency `[abort]` prefix → touch `handoff/abort-lv2` and
- *   dual-notify (channel reply + DM reply).
- * - `channel-warn`: chat_id is non-DM AND text starts with one of
- *   the non-emergency ops prefixes → 1-line warning, redirect to DM,
- *   log; no handler / subagent fires.
- * - `channel-passthrough`: chat_id is non-DM AND text starts with a
- *   recognized post-through verb (approve / cancel / OK / -impl
- *   variants) → silent; consultation session reads the original
- *   message via its own MCP notification.
- * - `channel-noop`: chat_id is non-DM AND text matches none of the
- *   above → silent (= unknown content, no watcher action).
- * - `unknown-channel-noop`: chat_id is neither D nor C (= `G...`,
- *   empty, malformed) → silent + log at the dispatch layer. Phase 1
- *   does not attempt to recover; Phase 2 may add channel registry
- *   refinement.
+ * - `channel-abort`: chat_id is **any non-DM** AND text starts with
+ *   the emergency `[abort]` prefix → touch `handoff/abort-lv2` and
+ *   dual-notify (channel reply + DM reply). This decision wins over
+ *   `unknown-channel-noop` so that even a malformed / unrecognized
+ *   chat_id (`G...`, empty, etc.) cannot silently swallow a stop
+ *   signal. Codex review on PR #9 flagged this as a merge blocker:
+ *   silently dropping a non-DM `[abort]` could lose an operator's
+ *   only halt action. The DM leg of the dual notify is unconditional
+ *   (we own that channel), so Hikaru sees the event regardless of
+ *   whether the source channel is replyable.
+ * - `channel-warn`: chat_id is `project-channel` (= `C...`) AND text
+ *   starts with one of the non-emergency ops prefixes → 1-line
+ *   warning, redirect to DM, log; no handler / subagent fires.
+ *   `[abort-test]` and `[abort cleanup]` route here too (= DM-only
+ *   maintained — these are non-emergency and stay in DM by design).
+ * - `channel-passthrough`: chat_id is `project-channel` AND text
+ *   starts with a recognized post-through verb (approve / cancel /
+ *   OK / -impl variants) → silent; consultation session reads the
+ *   original message via its own MCP notification.
+ * - `channel-noop`: chat_id is `project-channel` AND text matches
+ *   none of the above → silent (= unknown content, no watcher
+ *   action).
+ * - `unknown-channel-noop`: chat_id is neither D nor C **and** the
+ *   text is not `[abort]` (= `G...`, empty, malformed; only fires
+ *   when nothing actionable was detected) → silent + log at the
+ *   dispatch layer. Phase 1 does not attempt to recover; Phase 2 may
+ *   add channel registry refinement.
  */
 export type ChannelRouteDecision =
   | { kind: 'dm-passthrough' }
@@ -1148,9 +1159,16 @@ export type ChannelRouteDecision =
 export function routeInboundMessage(text: string, chatId: string): ChannelRouteDecision {
   const channelType = classifyChannelType(chatId)
   if (channelType === 'dm') return { kind: 'dm-passthrough' }
+  // Emergency `[abort]` MUST fire as global-abort regardless of the
+  // non-DM channel type. Even on `G...` / malformed chat_id, silently
+  // dropping the signal would mean an operator loses their only stop
+  // action — Codex review on PR #9 flagged this as a merge blocker.
+  // The dual-notify path's DM leg is unconditional (we own that
+  // channel), so Hikaru is informed even when the source channel is
+  // not replyable.
+  if (detectProjectAbortPrefix(text)) return { kind: 'channel-abort' }
   if (channelType === 'unknown') return { kind: 'unknown-channel-noop' }
   // channelType === 'project-channel'
-  if (detectProjectAbortPrefix(text)) return { kind: 'channel-abort' }
   const nonEmergency = detectNonEmergencyOpsPrefix(text)
   if (nonEmergency) return { kind: 'channel-warn', prefix: nonEmergency }
   const verb = detectPassthroughVerb(text)

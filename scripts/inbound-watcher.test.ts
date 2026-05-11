@@ -1301,10 +1301,30 @@ describe('routeInboundMessage', () => {
     expect(routeInboundMessage('', 'C1234567890')).toEqual({ kind: 'channel-noop' })
   })
 
-  test('G-prefixed / unknown chat_id → unknown-channel-noop (silent + log at dispatch)', () => {
-    expect(routeInboundMessage('[abort]', 'G123')).toEqual({ kind: 'unknown-channel-noop' })
+  test('G-prefixed / unknown chat_id → unknown-channel-noop UNLESS text is `[abort]`', () => {
+    // `[abort]` from a non-DM channel (= even G... / empty / malformed)
+    // MUST fire as channel-abort so the global stop signal cannot be
+    // silently dropped. Codex review on PR #9 flagged the previous
+    // ordering (unknown-channel-noop before [abort] check) as a merge
+    // blocker. Pin the corrected priority here.
+    expect(routeInboundMessage('[abort]', 'G123')).toEqual({ kind: 'channel-abort' })
+    expect(routeInboundMessage('[ABORT]', 'G999')).toEqual({ kind: 'channel-abort' })
+    expect(routeInboundMessage('[abort]', '')).toEqual({ kind: 'channel-abort' })
+    // Non-`[abort]` text on an unknown channel still drops to
+    // unknown-channel-noop (= silent + log; no handler / warn fires
+    // because there is no replyable target).
     expect(routeInboundMessage('status?', 'X999')).toEqual({ kind: 'unknown-channel-noop' })
     expect(routeInboundMessage('hello', '')).toEqual({ kind: 'unknown-channel-noop' })
+    // `[abort-test]` / `[abort cleanup]` stay DM-only via the existing
+    // exact-bracket guard in detectProjectAbortPrefix — on an unknown
+    // channel they fall to unknown-channel-noop (= silent), NOT
+    // channel-abort and NOT channel-warn.
+    expect(routeInboundMessage('[abort-test]', 'G123')).toEqual({
+      kind: 'unknown-channel-noop',
+    })
+    expect(routeInboundMessage('[abort cleanup]', 'G123')).toEqual({
+      kind: 'unknown-channel-noop',
+    })
   })
 })
 
