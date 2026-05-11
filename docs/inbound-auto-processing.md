@@ -34,6 +34,23 @@ The watcher does **not** implement Block Kit confirmations or
 multi-step approval; bare `OK` requires three independent conditions
 (unique pending + TTL + thread match) to gate the action.
 
+### Thread-reply polling (bd ccsc-v5m)
+
+`conversations.history` only returns top-level DM messages, so a
+Slack reply typed INSIDE a thread the watcher previously posted into
+would never reach `handleApprove` / `handleCancel`. The watcher
+maintains a small in-memory tracker of every threadTs it has replied
+into (persisted to `$SLACK_STATE_DIR/inbound-watcher.active-threads.json`,
+15-minute TTL) and polls each tracked thread via
+`conversations.replies` on every main-loop tick.
+
+Thread-reply polling **only fires the approved-dispatch verbs**
+(`OK` / `approve` / `cancel` / `pending?`). `[abort]` /
+`[abort-test]` / `[abort cleanup]` / `[codex-review]` / `status?` /
+`prs?` stay main-DM-only to prevent thread-injection misfire. The
+sender gate is unchanged — dispatch verbs are Hikaru-only regardless
+of whether the message arrives via main DM or thread reply.
+
 ## Architecture
 
 ```

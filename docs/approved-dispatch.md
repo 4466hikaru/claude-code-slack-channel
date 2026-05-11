@@ -140,6 +140,21 @@ exists at sweep time:
 This matches `bd ccsc-81q` D5: "abort 解除後 (`[abort cleanup]`) は保留
 中の `approved` を順次 dispatch".
 
+## Thread-reply polling
+
+The watcher tracks every threadTs it has replied into (15-minute TTL,
+persisted to `$SLACK_STATE_DIR/inbound-watcher.active-threads.json`)
+and polls each via `conversations.replies` on every main-loop tick.
+This lets Hikaru type the approval inside the thread the watcher
+posted to — e.g. send `pending?` at the DM root, then reply
+`approve <draft-id>` IN the same thread Slack thread the watcher
+listed pendings into.
+
+Thread replies fire ONLY the four dispatch verbs (`OK` / `approve` /
+`cancel` / `pending?`). `[abort]` family, `[codex-review]`, `status?`
+and `prs?` stay main-DM-only so a thread-injected message cannot
+misfire a destructive or queue operation.
+
 ## Operational ops
 
 - **Run** the watcher as before (`bun scripts/inbound-watcher.ts`); the
