@@ -137,7 +137,6 @@ import {
   CONSULT_MISMATCH_PROMPT,
   CONSULT_PERMISSIVE_PROMPT,
   CONSULT_QUEUE_DIR,
-  TO_EXECUTE_DIR,
   classifyConsultSourceChannel,
   consultDispatchFilename,
   consultRequestFilename,
@@ -153,8 +152,10 @@ import {
   parseHikaruConsultReply,
   rewriteConsultFrontmatter,
   routeConsultThreadReply,
+  TO_EXECUTE_DIR,
   trackingForConsultPlanReply,
 } from './lib/consult-queue'
+import { loadActiveProjectChannels } from './lib/project-channel-registry'
 import {
   APPROVE_GRACE_MS,
   extractDraftIdArg,
@@ -190,6 +191,7 @@ const STATE_DIR = process.env.SLACK_STATE_DIR || join(homedir(), '.claude', 'cha
 const ENV_FILE = join(STATE_DIR, '.env')
 const CONFIG_FILE = join(STATE_DIR, 'inbound-watcher.config.json')
 const LAST_TS_FILE = join(STATE_DIR, 'inbound-watcher.last-ts')
+const PROJECT_CHANNEL_LAST_TS_FILE = join(STATE_DIR, 'inbound-watcher.project-channel-last-ts.json')
 const LOCK_FILE = join(STATE_DIR, 'inbound-watcher.pid')
 const ACTIVE_THREADS_FILE = join(STATE_DIR, ACTIVE_THREADS_FILE_NAME)
 
@@ -1284,6 +1286,35 @@ interface Config {
   codexReviewSenderUserIds?: string[]
 }
 
+export type ProjectChannelLastTs = Record<string, string>
+
+export function loadProjectChannelLastTs(path: string): ProjectChannelLastTs {
+  if (!existsSync(path)) return {}
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf-8')) as unknown
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out: ProjectChannelLastTs = {}
+    for (const [channel, ts] of Object.entries(raw)) {
+      if (/^C[A-Z0-9]+$/.test(channel) && typeof ts === 'string' && ts.length > 0) {
+        out[channel] = ts
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+function saveProjectChannelLastTs(path: string, cursors: ProjectChannelLastTs): void {
+  writeFileSync(path, `${JSON.stringify(cursors, null, 2)}\n`)
+}
+
+export function activeProjectChannelIds(
+  active: ReadonlyArray<{ project_channel_id: string }>,
+): string[] {
+  return Array.from(new Set(active.map((c) => c.project_channel_id))).sort()
+}
+
 function loadConfig(): Config {
   if (!existsSync(CONFIG_FILE)) {
     console.error(`[watcher] missing config: ${CONFIG_FILE}`)
@@ -1444,6 +1475,10 @@ async function main(): Promise<void> {
   const activeThreads: ActiveThreadMap = loadActiveThreads(ACTIVE_THREADS_FILE)
   pruneStaleThreads(activeThreads, Date.now())
 
+  const projectChannelLastTs: ProjectChannelLastTs = loadProjectChannelLastTs(
+    PROJECT_CHANNEL_LAST_TS_FILE,
+  )
+
   // Executor completion relay dedup window (bd ccsc-sbf). RAM only —
   // the authoritative source of truth that a done file has been relayed
   // is the file's location (= once moved into `processed/`, it is no
@@ -1483,6 +1518,69 @@ async function main(): Promise<void> {
       console.error(
         `[watcher] saveActiveThreads error: ${e instanceof Error ? e.message : String(e)}`,
       )
+    }
+  }
+
+  async function postToChannel(channel: string, text: string, threadTs: string): Promise<void> {
+    await slack.chat.postMessage({
+      channel,
+      text,
+      thread_ts: threadTs,
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+  }
+
+  async function handleProjectChannelAbort(
+    msg: SlackMessage,
+    channel: string,
+    threadTs: string,
+  ): Promise<void> {
+    const ts = typeof msg.ts === 'string' ? msg.ts : threadTs
+    if (!existsSync(ABORT_FLAG)) {
+      execFileSync('touch', [ABORT_FLAG])
+    }
+    await postToChannel(channel, formatChannelAbortChannelReply(ABORT_FLAG), threadTs)
+    await slack.chat.postMessage({
+      channel: config.hikaruDmChannel,
+      text: formatChannelAbortDmReply(channel, ts),
+      unfurl_links: false,
+      unfurl_media: false,
+    })
+  }
+
+  async function handleProjectChannelMessage(channel: string, msg: SlackMessage): Promise<void> {
+    const text = typeof msg.text === 'string' ? msg.text : ''
+    const ts = typeof msg.ts === 'string' ? msg.ts : ''
+    const userId = typeof msg.user === 'string' ? msg.user : ''
+    if (text.length === 0 || ts.length === 0) return
+    if (userId !== config.hikaruUserId) return
+
+    const threadTs = (msg.thread_ts as string | undefined) ?? ts
+    const route = routeInboundMessage(text, channel)
+    switch (route.kind) {
+      case 'dm-passthrough':
+        return
+      case 'channel-abort':
+        await handleProjectChannelAbort(msg, channel, threadTs)
+        console.log(`[watcher] project-channel abort channel=${channel} ts=${ts}`)
+        return
+      case 'channel-warn':
+        await postToChannel(channel, formatChannelWarnReply(route.prefix), threadTs)
+        console.log(
+          `[watcher] project-channel warn channel=${channel} prefix=${route.prefix} ts=${ts}`,
+        )
+        return
+      case 'channel-passthrough':
+        console.log(
+          `[watcher] project-channel passthrough channel=${channel} verb=${route.verb} ts=${ts}`,
+        )
+        return
+      case 'channel-noop':
+        return
+      case 'unknown-channel-noop':
+        console.log(`[watcher] project-channel unknown-noop channel=${channel} ts=${ts}`)
+        return
     }
   }
 
@@ -2187,6 +2285,73 @@ async function main(): Promise<void> {
     }
   }
 
+  async function pollProjectChannels(): Promise<void> {
+    const registry = loadActiveProjectChannels(PROJECT_REQUESTS_DIR)
+    if (registry.malformed_count > 0 || registry.duplicate_skip_count > 0) {
+      console.warn(
+        `[watcher] project-channel registry stats malformed=${registry.malformed_count} duplicates=${registry.duplicate_skip_count} total=${registry.total_files}`,
+      )
+    }
+    const channels = activeProjectChannelIds(registry.active)
+    if (channels.length === 0) return
+
+    let cursorMutated = false
+    for (const channel of channels) {
+      let oldest = projectChannelLastTs[channel]
+      if (!oldest) {
+        oldest = String(Math.floor(Date.now() / 1000))
+        projectChannelLastTs[channel] = oldest
+        cursorMutated = true
+        console.log(`[watcher] project-channel initialized channel=${channel} oldest=${oldest}`)
+        continue
+      }
+
+      let result: Awaited<ReturnType<typeof slack.conversations.history>>
+      try {
+        result = await slack.conversations.history({
+          channel,
+          oldest,
+          inclusive: false,
+          limit: 50,
+        })
+      } catch (e) {
+        console.error(
+          `[watcher] project-channel history error channel=${channel}: ${e instanceof Error ? e.message : String(e)}`,
+        )
+        continue
+      }
+
+      const messages = (result.messages ?? []).slice().reverse()
+      for (const msg of messages) {
+        if (typeof msg.text !== 'string' || typeof msg.ts !== 'string') continue
+        try {
+          await handleProjectChannelMessage(channel, msg as SlackMessage)
+        } catch (e) {
+          console.error(
+            `[watcher] project-channel handler error channel=${channel} ts=${msg.ts}: ${e instanceof Error ? e.message : String(e)}`,
+          )
+        }
+      }
+      if (messages.length > 0) {
+        const newest = messages[messages.length - 1].ts
+        if (typeof newest === 'string') {
+          projectChannelLastTs[channel] = newest
+          cursorMutated = true
+        }
+      }
+    }
+
+    if (cursorMutated) {
+      try {
+        saveProjectChannelLastTs(PROJECT_CHANNEL_LAST_TS_FILE, projectChannelLastTs)
+      } catch (e) {
+        console.error(
+          `[watcher] save project-channel cursors error: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+    }
+  }
+
   /**
    * Thread-reply sweep (bd ccsc-v5m). For every active thread the
    * watcher previously replied into, poll `conversations.replies`
@@ -2603,7 +2768,8 @@ async function main(): Promise<void> {
     switch (decision.kind) {
       case 'approve': {
         const approvedAt = new Date()
-        const planRef = typeof consult.fm.codex_plan_ref === 'string' ? consult.fm.codex_plan_ref : ''
+        const planRef =
+          typeof consult.fm.codex_plan_ref === 'string' ? consult.fm.codex_plan_ref : ''
         let dispatchPath: string | null = null
         if (planRef.length > 0) {
           try {
@@ -2622,7 +2788,10 @@ async function main(): Promise<void> {
               throw new Error(`invalid consult created_at: ${createdRaw}`)
             }
             mkdirSync(TO_EXECUTE_DIR, { recursive: true })
-            dispatchPath = join(TO_EXECUTE_DIR, consultDispatchFilename(dispatchCreatedAt, consultId))
+            dispatchPath = join(
+              TO_EXECUTE_DIR,
+              consultDispatchFilename(dispatchCreatedAt, consultId),
+            )
             const assignment = buildConsultExecuteAssignment({
               consultId,
               createdAt: approvedAt,
@@ -2855,6 +3024,13 @@ async function main(): Promise<void> {
       await poll()
     } catch (e) {
       console.error(`[watcher] poll error: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    try {
+      await pollProjectChannels()
+    } catch (e) {
+      console.error(
+        `[watcher] project-channel poll error: ${e instanceof Error ? e.message : String(e)}`,
+      )
     }
     try {
       await dispatchSweep()

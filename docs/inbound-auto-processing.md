@@ -238,6 +238,38 @@ Phase 2C (route wire-up of `routeInboundMessage` into the loop)
 will land in separate bd issues / PRs. Until then this file is
 dead code in production and is exercised only by unit tests.
 
+
+### Project channel polling wire-up (bd ccsc-c3p, Phase 2B/2C)
+
+The watcher now consumes the Phase 2A registry loader on every main-loop tick.
+Active project channels are sourced from `handoff/project-requests/*.md` where
+`project_channel_id` is a non-empty `C...` value and `project_channel_status` is
+not `archived`, `cancelled`, or `failed`.
+
+Each active channel is polled with its own cursor persisted in:
+
+```
+$SLACK_STATE_DIR/inbound-watcher.project-channel-last-ts.json
+```
+
+The DM cursor (`inbound-watcher.last-ts`) remains unchanged. When a channel is
+first linked, the watcher initializes that channel cursor to the current time and
+does not backfill old channel history; only messages after linkage are considered.
+
+Channel routing uses the existing `routeInboundMessage(text, chatId)` decisions:
+
+| decision | runtime behavior |
+|---|---|
+| `channel-abort` | Hikaru's `[abort]` in any linked project channel touches `handoff/abort-lv2`, replies in the source thread, and notifies Hikaru's DM |
+| `channel-warn` | non-emergency ops prefixes such as `status?`, `[tech]`, `[codex-review]`, `[abort-test]`, and `[abort cleanup]` get a one-line redirect to DM and do not run their normal handler |
+| `channel-passthrough` | `OK`, `approve`, `cancel`, `approve-impl`, and `cancel-impl` are logged and left for the consultation session / later phases; the watcher does not auto-handle them from channels |
+| `channel-noop` | ordinary project discussion is ignored by the watcher |
+
+Only Hikaru's configured Slack user id can trigger project-channel watcher actions.
+Slack channel creation (`conversations.create` / `conversations.invite`) remains out
+of scope; linking is still done by filling `project_channel_id` in the project-request
+frontmatter.
+
 ### Executor completion relay (bd ccsc-sbf)
 
 Passive-execution Claude sessions cannot post to Slack themselves
