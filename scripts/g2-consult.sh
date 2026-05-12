@@ -3,7 +3,14 @@
 # Queue registration only; delegates all safety behavior to terminal-consult.ts.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "${SOURCE}" ]]; do
+  DIR="$(cd -P -- "$(dirname -- "${SOURCE}")" && pwd)"
+  SOURCE="$(readlink -- "${SOURCE}")"
+  [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "${SOURCE}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 if [[ -n "${BUN_BIN:-}" ]]; then
