@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+  activeProjectChannelIds,
   buildProjectRequestAck,
   buildProjectRequestFrontmatter,
   clampPollInterval,
@@ -27,6 +28,7 @@ import {
   isAllowedSender,
   listProjectRequestEntries,
   listQueueEntries,
+  loadProjectChannelLastTs,
   NEW_PROJECT_BODY_MAX_BYTES,
   NON_EMERGENCY_OPS_PREFIXES,
   parseCodexReview,
@@ -1444,5 +1446,51 @@ describe('buildProjectRequestAck', () => {
   test('project-channel type does NOT add unknown warning', () => {
     const ack = buildProjectRequestAck({ ...base, channelType: 'project-channel' })
     expect(ack).not.toContain('source channel 不明')
+  })
+})
+
+// --- bd ccsc-c3p: project channel polling helpers ---------------------
+
+describe('project channel polling helpers', () => {
+  test('activeProjectChannelIds dedupes and sorts active registry ids', () => {
+    expect(
+      activeProjectChannelIds([
+        { project_channel_id: 'C222' },
+        { project_channel_id: 'C111' },
+        { project_channel_id: 'C222' },
+      ]),
+    ).toEqual(['C111', 'C222'])
+  })
+
+  test('loadProjectChannelLastTs accepts only C-channel string cursors', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'project-channel-cursors-'))
+    try {
+      const path = join(dir, 'cursors.json')
+      writeFileSync(
+        path,
+        JSON.stringify({
+          C123: '1700.1',
+          D123: '1700.2',
+          CEMPTY: '',
+          CNUM: 123,
+          CABC: '1700.3',
+        }),
+      )
+      expect(loadProjectChannelLastTs(path)).toEqual({ C123: '1700.1', CABC: '1700.3' })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('loadProjectChannelLastTs returns empty object for missing or invalid JSON', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'project-channel-cursors-'))
+    try {
+      expect(loadProjectChannelLastTs(join(dir, 'missing.json'))).toEqual({})
+      const path = join(dir, 'bad.json')
+      writeFileSync(path, '{not-json')
+      expect(loadProjectChannelLastTs(path)).toEqual({})
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
