@@ -11,6 +11,8 @@ A `claude/channel` implementation for Slack. Socket Mode (outbound WebSocket, no
 
 **Links:** [GitHub](https://github.com/jeremylongshore/claude-code-slack-channel) · [Gist One-Pager](https://gist.github.com/jeremylongshore/2bef9c630d4269d2858a666ae75fca53) · [Release Notes](https://github.com/jeremylongshore/claude-code-slack-channel/releases/tag/v0.7.0)
 
+**Operator docs:** [Inbound auto-processing](inbound-auto-processing.md) · [Executor pickup](executor-pickup-runbook.md) · [Consult pickup](consult-pickup-runbook.md) · [Multi-agent operating rules](multi-agent-operating-rules.md)
+
 ---
 
 ## One-Pager
