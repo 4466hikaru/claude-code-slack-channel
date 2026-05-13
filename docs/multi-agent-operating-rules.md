@@ -39,6 +39,9 @@ Claude can propose work, but Codex owns dispatch and review.
    production, or merges unless the assignment explicitly says so and Hikaru has allowed it.
 7. If Claude misses a mandatory artifact, scope-drifts, fabricates completion, or needs
    repeated rescue, Codex reports that as an agent-quality issue instead of hiding it.
+8. Codex must not silently take work back from Claude because output quality is low.
+   The default response is to write Good / More feedback and send one specific correction
+   assignment back to Claude.
 
 ## Task Packet Minimum
 
@@ -99,6 +102,26 @@ Codex reviews Claude outputs before treating them as usable:
 4. For PRs, review the actual diff and CI state.
 5. If acceptable, merge or report depending on the assignment.
 6. If not acceptable, send a specific follow-up assignment, not vague feedback.
+
+## Good / More Feedback Loop
+
+When Claude output is weak, Codex acts as a playing manager, not a replacement worker.
+The default sequence is:
+
+1. Identify the miss against the original assignment.
+2. Write a Good / More feedback note using `docs/claude-good-and-more-feedback.md`.
+3. Send Claude a narrow correction assignment that references the note.
+4. Re-review the correction.
+5. Only take the work back locally if the user is blocked, the task is urgent, or there is
+   a production/data safety risk.
+
+Good / More means:
+
+- Good: what was useful and should be preserved
+- More: what was missing, risky, or below contract
+- Next: the exact correction artifact expected from Claude
+
+If Codex takes work back, it must record why reassignment was not the better move.
 
 ## Reporting To Hikaru
 
